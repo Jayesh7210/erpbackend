@@ -1,0 +1,40 @@
+{
+  "6602541b-1e4d-4162-bc86-e44f05cda0b3": {
+    "is_active": true,
+    "store_admin_commission": 5,
+    "fsm_commission": 10,
+    "salesman_commission": 50,
+    "referral_commission": 10
+  },
+  "p1": {
+    "is_active": true,
+    "base_price": 300,
+    "store_admin_commission": 5,
+    "fsm_commission": 10,
+    "salesman_commission": 50,
+    "referral_commission": 10
+  },
+  "p2": {
+    "is_active": true,
+    "base_price": 240,
+    "store_admin_commission": 4,
+    "fsm_commission": 8,
+    "salesman_commission": 40,
+    "referral_commission": 8
+  },
+  "p3": {
+    "is_active": true,
+    "base_price": 360,
+    "store_admin_commission": 6,
+    "fsm_commission": 12,
+    "salesman_commission": 60,
+    "referral_commission": 12
+  },
+  "6ec76f83-ce19-4d42-8f20-550b4f507ddd": {
+    "base_price": 300,
+    "store_admin_commission": 5,
+    "fsm_commission": 10,
+    "salesman_commission": 50,
+    "referral_commission": 10
+  }
+}
