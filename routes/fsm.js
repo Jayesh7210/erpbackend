@@ -15,12 +15,18 @@ router.get('/api/fsm/dashboard/:fsm_id', async (req, res) => {
   const fsmId = req.params.fsm_id || 'u3';
   let hub = mockDb.fsmSettlementHub || { depot_stock: 0, warehouse: { received: 0, allocated: 0, sold: 0, returned: 0 } };
 
+  let supervised = [];
   if (state.isSupabaseConfigured) {
     try {
       const { data: stocks } = await supabase.from('stocks').select('quantity').eq('owner_id', fsmId);
       const totalStock = (stocks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
       const { data: completedTrs } = await supabase.from('stock_transfers').select('quantity').eq('to_id', fsmId).eq('status', 'completed');
       const totalReceived = (completedTrs || []).reduce((sum, t) => sum + (Number(t.quantity) || 0), 0);
+
+      const { data: salesmenUsers, error: smErr } = await supabase.from('users').select('*').eq('role', 'salesman');
+      if (!smErr && salesmenUsers) {
+        supervised = salesmenUsers.filter(u => u.parent_id === fsmId || !u.parent_id || u.parent_id === 'c3456789-de23-45ff-67ff-8901abcdef23');
+      }
 
       hub = {
         depot_stock: totalStock,
@@ -32,8 +38,10 @@ router.get('/api/fsm/dashboard/:fsm_id', async (req, res) => {
         }
       };
     } catch (_) {}
+  } else {
+    // Only in local offline mock mode
+    supervised = (mockDb.users || []).filter(u => (u.parent_id === fsmId || !u.parent_id) && u.role === 'salesman');
   }
-  const supervised = (mockDb.users || []).filter(u => u.parent_id === fsmId && u.role === 'salesman');
   const totalBottlesSold = supervised.reduce((sum, s) => sum + (Number(s.sold_today) || 0), 0);
   const totalAllocated = supervised.reduce((sum, s) => sum + (Number(s.current_stock) || 0), 0);
   
@@ -77,15 +85,17 @@ router.get('/api/fsm/team/:fsm_id', async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data: users, error } = await supabase.from('users').select('*').eq('role', 'salesman');
-      if (!error && users && users.length > 0) {
-        const userIds = users.map(u => u.id);
-        const { data: stocks } = await supabase.from('stocks').select('*').in('owner_id', userIds);
-        const stockMap = new Map();
-        (stocks || []).forEach(s => {
-          stockMap.set(s.owner_id, (stockMap.get(s.owner_id) || 0) + (Number(s.quantity) || 0));
-        });
-
+      if (!error && users) {
         const supervised = users.filter(u => u.parent_id === fsmId || !u.parent_id || u.parent_id === 'c3456789-de23-45ff-67ff-8901abcdef23' || fsmId === 'u3' || fsmId === 'c3456789-de23-45ff-67ff-8901abcdef23');
+        const userIds = supervised.map(u => u.id);
+        const stockMap = new Map();
+        if (userIds.length > 0) {
+          const { data: stocks } = await supabase.from('stocks').select('*').in('owner_id', userIds);
+          (stocks || []).forEach(s => {
+            stockMap.set(s.owner_id, (stockMap.get(s.owner_id) || 0) + (Number(s.quantity) || 0));
+          });
+        }
+
         const activeCount = supervised.filter(u => u.is_active !== false).length;
         return res.json({
           summary: {
@@ -109,14 +119,8 @@ router.get('/api/fsm/team/:fsm_id', async (req, res) => {
     }
   }
 
-  let supervised = (mockDb.users || []).filter(u => (u.parent_id === fsmId || !u.parent_id) && u.role === 'salesman');
-  if (supervised.length === 0) {
-    supervised = [
-      { id: 'd4567890-ef34-56ff-78ff-9012abcdef34', name: 'Salesman John', zone: 'Zone A', code: 'SP-01', is_active: true, sold_today: 7, current_stock: 10, parent_id: fsmId, role: 'salesman' },
-      { id: '7481353a-adda-4cb6-889f-d5efe2dc1bd3', name: 'Rajesh Kumar', zone: 'Zone B', code: 'SP-02', is_active: true, sold_today: 4, current_stock: 5, parent_id: fsmId, role: 'salesman' },
-      { id: 'u5', name: 'Amit Kumar', zone: 'Zone C', code: 'SP-03', is_active: false, sold_today: 0, current_stock: 0, parent_id: fsmId, role: 'salesman' },
-    ];
-  }
+  // Fallback for local offline mode without DB
+  const supervised = (mockDb.users || []).filter(u => (u.parent_id === fsmId || !u.parent_id) && u.role === 'salesman');
   const activeCount = supervised.filter(u => u.is_active !== false).length;
   return res.json({
     summary: {
@@ -226,6 +230,7 @@ router.post('/api/fsm/warehouse-return-qr', async (req, res) => {
   const defaultUnitPrice = await getDefaultProductUnitPrice();
   const result = {
     qr_token: token,
+    return_code: token,
     fsm_id: fsm_id || 'u3',
     quantity: returnQty,
     inventory_value: returnQty * defaultUnitPrice,

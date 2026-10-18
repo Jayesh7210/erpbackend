@@ -4,7 +4,12 @@
     "store_admin_commission": 5,
     "fsm_commission": 10,
     "salesman_commission": 50,
-    "referral_commission": 10
+    "referral_commission": 10,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      { "from_qty": 101, "to_qty": 110, "added_commission": 5.0, "label": "Tier 1 (+₹5)" },
+      { "from_qty": 111, "to_qty": 130, "added_commission": 10.0, "label": "Tier 2 (+₹10)" }
+    ]
   },
   "p1": {
     "is_active": true,
@@ -12,7 +17,12 @@
     "store_admin_commission": 5,
     "fsm_commission": 10,
     "salesman_commission": 50,
-    "referral_commission": 10
+    "referral_commission": 10,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      { "from_qty": 101, "to_qty": 110, "added_commission": 5.0, "label": "Tier 1 (+₹5)" },
+      { "from_qty": 111, "to_qty": 130, "added_commission": 10.0, "label": "Tier 2 (+₹10)" }
+    ]
   },
   "p2": {
     "is_active": true,
@@ -20,7 +30,12 @@
     "store_admin_commission": 4,
     "fsm_commission": 8,
     "salesman_commission": 40,
-    "referral_commission": 8
+    "referral_commission": 8,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      { "from_qty": 101, "to_qty": 110, "added_commission": 4.0, "label": "Tier 1 (+₹4)" },
+      { "from_qty": 111, "to_qty": 130, "added_commission": 8.0, "label": "Tier 2 (+₹8)" }
+    ]
   },
   "p3": {
     "is_active": true,
@@ -28,13 +43,23 @@
     "store_admin_commission": 6,
     "fsm_commission": 12,
     "salesman_commission": 60,
-    "referral_commission": 12
+    "referral_commission": 12,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      { "from_qty": 101, "to_qty": 110, "added_commission": 6.0, "label": "Tier 1 (+₹6)" },
+      { "from_qty": 111, "to_qty": 130, "added_commission": 12.0, "label": "Tier 2 (+₹12)" }
+    ]
   },
   "6ec76f83-ce19-4d42-8f20-550b4f507ddd": {
     "base_price": 300,
     "store_admin_commission": 5,
     "fsm_commission": 10,
     "salesman_commission": 50,
-    "referral_commission": 10
+    "referral_commission": 10,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      { "from_qty": 101, "to_qty": 110, "added_commission": 5.0, "label": "Tier 1 (+₹5)" },
+      { "from_qty": 111, "to_qty": 130, "added_commission": 10.0, "label": "Tier 2 (+₹10)" }
+    ]
   }
 }

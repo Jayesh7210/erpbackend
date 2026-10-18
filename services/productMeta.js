@@ -36,6 +36,8 @@ function getProductWithMeta(productId) {
     fsm_commission: meta.fsm_commission !== undefined ? meta.fsm_commission : (prod.fsm_commission !== undefined ? prod.fsm_commission : 0.0),
     salesman_commission: meta.salesman_commission !== undefined ? meta.salesman_commission : (prod.salesman_commission !== undefined ? prod.salesman_commission : 0.0),
     referral_commission: meta.referral_commission !== undefined ? meta.referral_commission : (prod.referral_commission !== undefined ? prod.referral_commission : 0.0),
+    initial_stock_quota: meta.initial_stock_quota !== undefined ? meta.initial_stock_quota : (prod.initial_stock_quota !== undefined ? prod.initial_stock_quota : 100),
+    commission_slabs: meta.commission_slabs || prod.commission_slabs || []
   };
 }
 
