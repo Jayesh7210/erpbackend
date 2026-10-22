@@ -5,6 +5,14 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getProductWithMeta } = require('../services/productMeta');
+const {
+  superAdminGeneralLimiter,
+  superAdminSensitiveLimiter,
+  superAdminAnalyticsLimiter,
+  storeAdminGeneralLimiter,
+  salesmanGeneralLimiter,
+  salesmanOnboardingLimiter
+} = require('../services/rateLimiter');
 
 // Helper to build workforce referral tree
 function buildWorkforceTree() {
@@ -66,13 +74,13 @@ function buildWorkforceTree() {
   };
 }
 
-// Get full workforce referral tree
-router.get('/api/referrals/tree', (req, res) => {
+// Get full workforce referral tree (Protected by Analytics Rate Limiter)
+router.get('/api/referrals/tree', superAdminAnalyticsLimiter, (req, res) => {
   return res.json(buildWorkforceTree());
 });
 
-// Get all workforce referral commissions (Ledger)
-router.get('/api/referrals', async (req, res) => {
+// Get all workforce referral commissions (Ledger - Protected by General Admin Rate Limiter)
+router.get('/api/referrals', superAdminGeneralLimiter, async (req, res) => {
   const commissions = mockDb.workforceCommissions || [];
   const enriched = commissions.map(c => {
     return {
@@ -84,8 +92,8 @@ router.get('/api/referrals', async (req, res) => {
   return res.json(enriched);
 });
 
-// Process / approve referral payout
-router.post('/api/referrals/:id/payout', async (req, res) => {
+// Process / approve referral payout (Protected by Sensitive Admin Rate Limiter)
+router.post('/api/referrals/:id/payout', superAdminSensitiveLimiter, async (req, res) => {
   const { id } = req.params;
   const { admin_id, admin_name } = req.body;
 
@@ -116,11 +124,48 @@ router.post('/api/referrals/:id/payout', async (req, res) => {
   return res.json({ message: 'Payout marked as paid', referral: comm });
 });
 
-// Salesman Today's Earnings Breakdown
-router.get('/api/salesman/earnings/:salesman_id', (req, res) => {
+// Salesman Today's Earnings Breakdown (Protected by Salesman General Limiter)
+router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
-  const user = (mockDb.users || []).find(u => u.id === salesman_id);
-  const todaySales = (mockDb.sales || []).filter(s => s.salesman_id === salesman_id);
+  let user = (mockDb.users || []).find(u => u.id === salesman_id);
+  let todaySales = (mockDb.sales || []).filter(s => s.salesman_id === salesman_id);
+  let myReferralComms = (mockDb.workforceCommissions || []).filter(c => c.referrer_id === salesman_id && c.type === 'referral_bonus');
+
+  if (state.isSupabaseConfigured) {
+    try {
+      // 1. Fetch user duty & details
+      const { data: dbUser } = await supabase
+        .from('users')
+        .select('id, name, email, is_on_duty, role, parent_id, warehouse_id')
+        .eq('id', salesman_id)
+        .maybeSingle();
+      if (dbUser) {
+        user = { ...user, ...dbUser };
+      }
+
+      // 2. Fetch sales from Supabase
+      const { data: dbSales } = await supabase
+        .from('sales')
+        .select('*')
+        .eq('salesman_id', salesman_id);
+      if (dbSales && dbSales.length > 0) {
+        todaySales = dbSales;
+      }
+
+      // 3. Fetch workforce commissions for referrals
+      const { data: dbComms } = await supabase
+        .from('workforce_commissions')
+        .select('*')
+        .eq('referrer_id', salesman_id)
+        .eq('type', 'referral_bonus');
+      if (dbComms && dbComms.length > 0) {
+        myReferralComms = dbComms;
+      }
+    } catch (e) {
+      console.warn('salesman earnings Supabase query warning:', e.message);
+    }
+  }
+
   const soldBottlesToday = todaySales.reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
 
   // Dynamic direct sale commissions from products sold
@@ -132,7 +177,6 @@ router.get('/api/salesman/earnings/:salesman_id', (req, res) => {
   });
 
   // Dynamic referral commissions from direct downline referrals (Strictly 1-Level)
-  const myReferralComms = (mockDb.workforceCommissions || []).filter(c => c.referrer_id === salesman_id && c.type === 'referral_bonus');
   const downlineBottles = myReferralComms.reduce((sum, c) => sum + (Number(c.bottles_sold) || 0), 0);
   const unlockedReferralEarned = myReferralComms
     .filter(c => c.status === 'unlocked' || c.status === 'paid')
@@ -150,14 +194,52 @@ router.get('/api/salesman/earnings/:salesman_id', (req, res) => {
     referral_bottles: downlineBottles,
     total_earned: totalEarned,
     monthly_earnings: totalEarned,
-    monthly_bottles_sold: soldBottlesToday
+    monthly_bottles_sold: soldBottlesToday,
+    min_sales_quota: (user && user.min_sales_quota !== undefined) ? Number(user.min_sales_quota) : 0,
+    is_quota_condition_active: (user && user.is_quota_condition_active !== undefined) ? Boolean(user.is_quota_condition_active) : false,
+    is_qualified: (user && user.min_sales_quota) ? (soldBottlesToday >= user.min_sales_quota) : true
   });
 });
 
-// Salesman Referrals (Get & Submit)
-router.get('/api/salesman/referrals/:salesman_id', (req, res) => {
+// Salesman Referrals (Get & Submit - Protected by Salesman Limiters)
+router.get('/api/salesman/referrals/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
-  const list = (mockDb.salesmanReferrals || []).filter(r => r.referrer_id === salesman_id);
+  let list = (mockDb.salesmanReferrals || []).filter(r => r.referrer_id === salesman_id);
+
+  if (state.isSupabaseConfigured) {
+    try {
+      const { data: dbRequests } = await supabase
+        .from('user_creation_requests')
+        .select('*')
+        .eq('requested_by', salesman_id);
+
+      if (dbRequests && dbRequests.length > 0) {
+        const dbMapped = dbRequests.map(r => ({
+          id: r.id,
+          referrer_id: salesman_id,
+          referred_salesman_id: r.id,
+          full_name: r.name,
+          phone: r.phone || '',
+          status: r.status === 'approved' ? 'Active' : (r.status === 'rejected' ? 'Rejected' : 'Pending Approval'),
+          earned: 0,
+          bottles_sold: 0,
+          kyc_doc: r.kyc_doc || '',
+          kyc_status: r.status === 'approved' ? 'Verified' : 'Pending Review',
+          created_at: r.created_at
+        }));
+
+        const existingIds = new Set(list.map(x => x.id || x.referred_salesman_id));
+        for (const item of dbMapped) {
+          if (!existingIds.has(item.id) && !existingIds.has(item.referred_salesman_id)) {
+            list.push(item);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('salesman referrals Supabase fetch warning:', e.message);
+    }
+  }
+
   const enriched = list.map(ref => {
     const comms = (mockDb.workforceCommissions || []).filter(
       c => c.referrer_id === salesman_id && (c.seller_id === ref.referred_salesman_id || c.seller_name === ref.full_name)
@@ -180,7 +262,7 @@ router.get('/api/salesman/referrals/:salesman_id', (req, res) => {
   return res.json(enriched);
 });
 
-router.post('/api/salesman/referrals', async (req, res) => {
+router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, res) => {
   const { referrer_id, full_name, phone, kyc_doc } = req.body;
   if (!full_name || !phone) {
     return res.status(400).json({ error: 'Full name and phone number are required' });
@@ -189,6 +271,30 @@ router.post('/api/salesman/referrals', async (req, res) => {
   const generatedEmail = `${full_name.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Math.floor(100+Math.random()*900)}@erp.com`;
   const newReqId = `req_${Date.now()}`;
 
+  // Dynamically resolve referrer's warehouse_id and parent_id
+  let resolvedWarehouseId = null;
+  let resolvedParentId = null;
+
+  const referrerUser = (mockDb.users || []).find(u => u.id === referrer_id);
+  if (referrerUser) {
+    resolvedWarehouseId = referrerUser.warehouse_id || null;
+    resolvedParentId = referrerUser.parent_id || null;
+  }
+
+  if (state.isSupabaseConfigured && (!resolvedWarehouseId || !resolvedParentId)) {
+    try {
+      const { data: dbUser } = await supabase
+        .from('users')
+        .select('warehouse_id, parent_id')
+        .eq('id', referrer_id)
+        .maybeSingle();
+      if (dbUser) {
+        if (!resolvedWarehouseId && dbUser.warehouse_id) resolvedWarehouseId = dbUser.warehouse_id;
+        if (!resolvedParentId && dbUser.parent_id) resolvedParentId = dbUser.parent_id;
+      }
+    } catch (_) {}
+  }
+
   // 1. Create Onboarding Request in Super Admin's Approval Queue
   const newReq = {
     id: newReqId,
@@ -196,9 +302,9 @@ router.post('/api/salesman/referrals', async (req, res) => {
     email: generatedEmail,
     phone,
     role: 'salesman',
-    warehouse_id: 'w1',
-    parent_id: 'c3456789-de23-45ff-67ff-8901abcdef23',
-    requested_by: referrer_id || 'd4567890-ef34-56ff-78ff-9012abcdef34',
+    warehouse_id: resolvedWarehouseId,
+    parent_id: resolvedParentId,
+    requested_by: referrer_id || null,
     status: 'pending',
     requires_password_setup: true,
     aadhaar_number: '',
@@ -210,7 +316,7 @@ router.post('/api/salesman/referrals', async (req, res) => {
   // 2. Track in salesman's referrals list
   const newReferral = {
     id: `sm_ref_${Date.now()}`,
-    referrer_id: referrer_id || 'd4567890-ef34-56ff-78ff-9012abcdef34',
+    referrer_id: referrer_id || null,
     referred_salesman_id: newReqId,
     full_name,
     phone,
@@ -230,8 +336,8 @@ router.post('/api/salesman/referrals', async (req, res) => {
         name: full_name,
         email: generatedEmail,
         role: 'salesman',
-        warehouse_id: 'w1',
-        parent_id: 'c3456789-de23-45ff-67ff-8901abcdef23',
+        warehouse_id: resolvedWarehouseId,
+        parent_id: resolvedParentId,
         requested_by: referrer_id || null,
         status: 'pending'
       }]);
@@ -240,16 +346,60 @@ router.post('/api/salesman/referrals', async (req, res) => {
     }
   }
 
-  await logAudit(referrer_id || 'd4567890-ef34-56ff-78ff-9012abcdef34', 'Salesman', 'SUBMIT_REFERRAL', 'user_creation_requests', newReqId, `Submitted referral request for ${full_name} (${phone}) awaiting Super Admin approval`);
+  await logAudit(referrer_id || 'system', 'Salesman', 'SUBMIT_REFERRAL', 'user_creation_requests', newReqId, `Submitted referral request for ${full_name} (${phone}) awaiting Super Admin approval`);
   return res.status(201).json(newReferral);
 });
 
-// Store Admin Earnings Breakdown (Dynamic commissions from stock transfers to FSMs)
-router.get('/api/store-admin/earnings/:user_id', (req, res) => {
+// Store Admin Earnings Breakdown (Dynamic commissions from stock transfers to FSMs - Protected by Store Admin General Limiter)
+router.get('/api/store-admin/earnings/:user_id', storeAdminGeneralLimiter, async (req, res) => {
   const { user_id } = req.params;
-  const storeComms = (mockDb.workforceCommissions || []).filter(c => c.user_id === user_id && c.role === 'store_admin');
-  const todayEarned = storeComms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
-  const totalDispatched = storeComms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
+  let todayEarned = 0;
+  let totalDispatched = 0;
+  let storeComms = [];
+
+  if (state.isSupabaseConfigured) {
+    try {
+      const { data: dbUser } = await supabase.from('users').select('warehouse_id').eq('id', user_id).maybeSingle();
+      const warehouseId = dbUser?.warehouse_id;
+
+      // 1. Fetch direct workforce commissions
+      const query = warehouseId
+        ? supabase.from('workforce_commissions').select('*').or(`user_id.eq.${user_id},user_id.eq.${warehouseId}`)
+        : supabase.from('workforce_commissions').select('*').eq('user_id', user_id);
+      const { data: comms } = await query;
+
+      if (comms && comms.length > 0) {
+        storeComms = comms;
+        todayEarned = comms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
+        totalDispatched = comms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
+      } else if (warehouseId) {
+        // Dynamic calculation from completed stock transfers from this warehouse
+        const { data: trs } = await supabase
+          .from('stock_transfers')
+          .select('*, product:products(*)')
+          .or(`from_id.eq.${warehouseId},from_id.eq.${user_id}`)
+          .eq('status', 'completed');
+        if (trs && trs.length > 0) {
+          trs.forEach(t => {
+            const q = Number(t.quantity) || 0;
+            const rate = Number(t.product?.store_admin_commission) || 0.0;
+            totalDispatched += q;
+            todayEarned += q * rate;
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Store admin earnings Supabase error:', e.message);
+    }
+  }
+
+  if (storeComms.length === 0 && todayEarned === 0) {
+    const mockComms = (mockDb.workforceCommissions || []).filter(c => c.user_id === user_id && c.role === 'store_admin');
+    todayEarned = mockComms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
+    totalDispatched = mockComms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
+    storeComms = mockComms;
+  }
+
   return res.json({
     store_admin_id: user_id,
     today_earned: todayEarned,

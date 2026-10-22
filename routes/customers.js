@@ -3,9 +3,10 @@ const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
 const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
+const { storeAdminGeneralLimiter, storeAdminTransactionLimiter } = require('../services/rateLimiter');
 
-// Customers & Distributors Directory
-router.get('/api/customers', async (req, res) => {
+// Customers & Distributors Directory (Protected by General Store Admin Limiter)
+router.get('/api/customers', storeAdminGeneralLimiter, async (req, res) => {
   const { customer_type, salesman_id } = req.query;
   if (state.isSupabaseConfigured) {
     try {
@@ -37,7 +38,8 @@ router.get('/api/customers', async (req, res) => {
   return res.json(list);
 });
 
-router.post('/api/customers', async (req, res) => {
+// Register Customer or Distributor (Protected by Transaction Limiter)
+router.post('/api/customers', storeAdminTransactionLimiter, async (req, res) => {
   const { name, phone, email, address, customer_type, referral_code, created_by } = req.body;
   if (!name) return res.status(400).json({ error: 'Customer name is required' });
 

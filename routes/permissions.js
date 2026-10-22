@@ -4,9 +4,10 @@ const { supabaseAdmin: supabase } = require('../db');
 const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
+const { superAdminGeneralLimiter, superAdminSensitiveLimiter } = require('../services/rateLimiter');
 
-// Get all role permissions
-router.get('/api/permissions', async (req, res) => {
+// Get all role permissions (Protected by General Admin Rate Limiter)
+router.get('/api/permissions', superAdminGeneralLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data, error } = await supabase.from('roles_permissions').select('*');
@@ -20,8 +21,8 @@ router.get('/api/permissions', async (req, res) => {
   return res.json(mockDb.roles_permissions);
 });
 
-// Update role permission toggle
-router.put('/api/permissions', async (req, res) => {
+// Update role permission toggle (Protected by Sensitive Admin Rate Limiter)
+router.put('/api/permissions', superAdminSensitiveLimiter, async (req, res) => {
   const { role, permission_key, is_allowed, admin_id, admin_name } = req.body;
   if (!role || !permission_key || is_allowed === undefined) {
     return res.status(400).json({ error: 'role, permission_key, and is_allowed are required' });

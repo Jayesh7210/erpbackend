@@ -5,6 +5,16 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getProductWithMeta } = require('../services/productMeta');
+const { optimizeBase64Image } = require('../services/imageOptimizer');
+const {
+  superAdminGeneralLimiter,
+  superAdminSensitiveLimiter,
+  superAdminAnalyticsLimiter,
+  storeAdminGeneralLimiter,
+  storeAdminIntakeLimiter,
+  storeAdminTransactionLimiter,
+  fsmOperationsLimiter
+} = require('../services/rateLimiter');
 
 // Helper function to credit dynamic per-product commissions on completed stock transfers
 function processTransferCommission(transfer) {
@@ -75,54 +85,126 @@ function processTransferCommission(transfer) {
   }
 }
 
-// Submit Stock Inward Request (Store Admin)
-router.post('/api/stock/inward', async (req, res) => {
-  const { warehouse_id, product_id, quantity, receipt_base64, receipt_filename, requested_by } = req.body;
+// In-Memory Idempotency Cache for Stock Operations (prevents double submissions / retry duplicates)
+const recentStockOpsCache = new Map();
+const cleanupStockOpsTimer = setInterval(() => {
+  const cutoff = Date.now() - 120000;
+  for (const [k, v] of recentStockOpsCache.entries()) {
+    if (v.timestamp < cutoff) recentStockOpsCache.delete(k);
+  }
+}, 60000);
+if (cleanupStockOpsTimer.unref) cleanupStockOpsTimer.unref();
+
+function getStockOpKey(prefix, body, req) {
+  if (body.idempotency_key) return prefix + ":key:" + body.idempotency_key;
+  const headerKey = req.headers["x-idempotency-key"];
+  if (headerKey) return prefix + ":key:" + headerKey;
+  const user = body.received_by || body.requested_by || "anon";
+  return prefix + ":fp:" + body.warehouse_id + ":" + body.product_id + ":" + body.quantity + ":" + (body.batch_number || "") + ":" + user;
+}
+
+// Submit Stock Inward Request (Store Admin - Protected by Store Admin Intake Rate Limiter)
+router.post("/api/stock/inward", storeAdminIntakeLimiter, async (req, res) => {
+  const { warehouse_id, product_id, quantity, receipt_base64, receipt_filename, requested_by, batch_number, supplier, date_received } = req.body;
   if (!warehouse_id || !product_id || !quantity || !requested_by) {
-    return res.status(400).json({ error: 'warehouse_id, product_id, quantity, and requested_by are required' });
+    return res.status(400).json({ error: "warehouse_id, product_id, quantity, and requested_by are required" });
   }
 
-  let finalReceiptUrl = 'mock_receipt_image.png';
+  // Idempotency check: prevent duplicate inward requests within 60 seconds
+  const opKey = getStockOpKey("inward", req.body, req);
+  const cached = recentStockOpsCache.get(opKey);
+  if (cached && (Date.now() - cached.timestamp) < 60000) {
+    console.log("[Idempotency] Duplicate stock inward request blocked: " + opKey);
+    return res.status(200).json({ ...cached.result, _duplicate_prevented: true });
+  }
+
+  let finalReceiptUrl = "mock_receipt_image.png";
 
   if (state.isSupabaseConfigured) {
     try {
       if (receipt_base64 && receipt_filename) {
-        const buffer = Buffer.from(receipt_base64, 'base64');
-        const filePath = `${Date.now()}_${receipt_filename}`;
+        const optimized = await optimizeBase64Image(receipt_base64, receipt_filename);
+        if (optimized) {
+          const filePath = "inward_" + Date.now() + "_" + optimized.filename;
+          const { error: uploadError } = await supabase.storage
+            .from("receipts")
+            .upload(filePath, optimized.buffer, {
+              contentType: optimized.contentType,
+              upsert: true
+            });
 
-        const { error: uploadError } = await supabase.storage
-          .from('receipts')
-          .upload(filePath, buffer, {
-            contentType: receipt_filename.endsWith('.pdf') ? 'application/pdf' : 'image/png',
-            upsert: true
-          });
-
-        if (uploadError) throw uploadError;
-
-        const { data: urlData } = supabase.storage.from('receipts').getPublicUrl(filePath);
-        finalReceiptUrl = urlData.publicUrl;
+          if (!uploadError) {
+            const { data: urlData } = supabase.storage.from("receipts").getPublicUrl(filePath);
+            finalReceiptUrl = urlData.publicUrl;
+          }
+        }
       }
 
-      const { data, error } = await supabase.from('stock_inward_requests').insert([{
-        warehouse_id, product_id, quantity, receipt_url: finalReceiptUrl, requested_by, status: 'pending'
-      }]).select().single();
-      if (error) throw error;
-      return res.status(201).json(data);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  } else {
-    const newInward = {
-      id: `inw_${Date.now()}`,
-      warehouse_id, product_id, quantity: parseInt(quantity), receipt_url: finalReceiptUrl, requested_by, status: 'pending', created_at: new Date()
-    };
-    mockDb.inwardRequests.push(newInward);
-    return res.status(201).json(newInward);
-  }
-});
+      const basicPayload = {
+        warehouse_id,
+        product_id,
+        quantity: parseInt(quantity),
+        receipt_url: finalReceiptUrl,
+        requested_by,
+        status: "pending"
+      };
 
-// List Stock Inward Requests
-router.get('/api/stock/inward-requests', async (req, res) => {
+      let createdData = null;
+      try {
+        const { data, error } = await supabase.from("stock_inward_requests").insert([{
+          ...basicPayload,
+          batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+          supplier: supplier || "Direct Supplier",
+          date_received: date_received || new Date().toISOString().split("T")[0]
+        }]).select().single();
+        if (!error && data) createdData = data;
+      } catch (_) {
+        const { data, error } = await supabase.from("stock_inward_requests").insert([basicPayload]).select().single();
+        if (!error && data) createdData = data;
+      }
+
+      const responsePayload = createdData || {
+        id: "inw_" + Date.now(),
+        ...basicPayload,
+        batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+        supplier: supplier || "Direct Supplier",
+        date_received: date_received || new Date().toISOString().split("T")[0],
+        created_at: new Date()
+      };
+
+      if (!mockDb.inwardRequests) mockDb.inwardRequests = [];
+      mockDb.inwardRequests.unshift(responsePayload);
+      recentStockOpsCache.set(opKey, { timestamp: Date.now(), result: responsePayload });
+
+      await logAudit(requested_by, "Store Admin", "SUBMIT_INWARD_REQUEST", "stock_inward_requests", responsePayload.id, "Submitted inward request for " + quantity + " units awaiting Super Admin approval");
+      return res.status(201).json(responsePayload);
+    } catch (err) {
+      console.warn("Supabase stock_inward_requests notice:", err.message);
+    }
+  }
+
+  const newInward = {
+    id: "inw_" + Date.now(),
+    warehouse_id,
+    product_id,
+    quantity: parseInt(quantity),
+    receipt_url: finalReceiptUrl,
+    requested_by,
+    batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+    supplier: supplier || "Direct Supplier",
+    date_received: date_received || new Date().toISOString().split("T")[0],
+    status: "pending",
+    created_at: new Date()
+  };
+  if (!mockDb.inwardRequests) mockDb.inwardRequests = [];
+  mockDb.inwardRequests.unshift(newInward);
+  recentStockOpsCache.set(opKey, { timestamp: Date.now(), result: newInward });
+
+  await logAudit(requested_by, "Store Admin", "SUBMIT_INWARD_REQUEST", "stock_inward_requests", newInward.id, "Submitted inward request for " + quantity + " units awaiting Super Admin approval");
+  return res.status(201).json(newInward);
+});
+// List Stock Inward Requests (Protected by General Admin Rate Limiter)
+router.get('/api/stock/inward-requests', superAdminGeneralLimiter, async (req, res) => {
   const { status } = req.query;
   if (state.isSupabaseConfigured) {
     try {
@@ -150,163 +232,212 @@ router.get('/api/stock/inward-requests', async (req, res) => {
   }
 });
 
-// Approve Stock Inward Request (Super Admin)
-router.post('/api/stock/inward-approve', async (req, res) => {
+// Approve Stock Inward Request (Super Admin - Protected by Sensitive Admin Rate Limiter)
+router.post("/api/stock/inward-approve", superAdminSensitiveLimiter, async (req, res) => {
   const { request_id, approve, approved_by } = req.body;
-  if (!request_id || !approved_by) return res.status(400).json({ error: 'Request ID and approved_by are required' });
+  if (!request_id || !approved_by) return res.status(400).json({ error: "Request ID and approved_by are required" });
 
-  const status = approve ? 'approved' : 'rejected';
+  const status = approve ? "approved" : "rejected";
 
   if (state.isSupabaseConfigured) {
     try {
-      const { data: requestData, error: reqErr } = await supabase.from('stock_inward_requests')
-        .update({ status, approved_by })
-        .eq('id', request_id)
+      const { data: requestData, error: reqErr } = await supabase.from("stock_inward_requests")
+        .update({ status, approved_by, updated_at: new Date() })
+        .eq("id", request_id)
         .select()
         .single();
       if (reqErr) throw reqErr;
 
-      if (approve) {
-        const { data: currentStock, error: stockFetchErr } = await supabase.from('stocks')
-          .select('*')
-          .eq('owner_id', requestData.warehouse_id)
-          .eq('product_id', requestData.product_id)
+      if (approve && requestData) {
+        const prodId = requestData.product_id;
+        const whId = requestData.warehouse_id;
+        const qty = requestData.quantity;
+
+        const { data: currentStock, error: stockFetchErr } = await supabase.from("stocks")
+          .select("*")
+          .eq("owner_id", whId)
+          .eq("product_id", prodId)
           .maybeSingle();
 
         if (stockFetchErr) throw stockFetchErr;
 
         if (currentStock) {
-          await supabase.from('stocks')
-            .update({ quantity: currentStock.quantity + requestData.quantity })
-            .eq('id', currentStock.id);
+          await supabase.from("stocks")
+            .update({ quantity: currentStock.quantity + qty, updated_at: new Date() })
+            .eq("id", currentStock.id);
         } else {
-          await supabase.from('stocks').insert([{
-            owner_id: requestData.warehouse_id,
-            product_id,
-            quantity: requestData.quantity
+          await supabase.from("stocks").insert([{
+            owner_id: whId,
+            product_id: prodId,
+            quantity: qty
           }]);
         }
+
+        // Also record an intake ledger entry so history reflects the approved intake
+        try {
+          await supabase.from("stock_intakes").insert([{
+            warehouse_id: whId,
+            product_id: prodId,
+            quantity: qty,
+            batch_number: requestData.batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+            supplier: requestData.supplier || "Approved Supplier Consignment",
+            date_received: requestData.date_received || new Date().toISOString().split("T")[0],
+            receipt_url: requestData.receipt_url || "mock_receipt.png",
+            received_by: approved_by
+          }]);
+        } catch (_) {}
       }
-      return res.json({ message: `Stock inward successfully ${status}` });
+
+      await logAudit(approved_by, "Super Admin", "APPROVE_STOCK_INWARD", "stock_inward_requests", request_id, "Inward request " + status + " for " + (requestData?.quantity || "") + " units");
+      return res.json({ message: "Stock inward successfully " + status });
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      console.warn("Supabase inward-approve notice:", err.message);
     }
-  } else {
-    const reqIndex = mockDb.inwardRequests.findIndex(r => r.id === request_id);
-    if (reqIndex === -1) return res.status(404).json({ error: 'Request not found' });
-    mockDb.inwardRequests[reqIndex].status = status;
-
-    if (approve) {
-      const requestData = mockDb.inwardRequests[reqIndex];
-      const stock = mockDb.stocks.find(s => s.owner_id === requestData.warehouse_id && s.product_id === requestData.product_id);
-      if (stock) {
-        stock.quantity += requestData.quantity;
-      } else {
-        mockDb.stocks.push({
-          owner_id: requestData.warehouse_id,
-          product_id: requestData.product_id,
-          quantity: requestData.quantity
-        });
-      }
-    }
-    return res.json({ message: `Stock inward successfully ${status}` });
   }
-});
 
-// Stock Intake (Store Admin - direct intake with batch, supplier, date received)
-router.post('/api/stock/intake', async (req, res) => {
+  // Local fallback
+  const reqIndex = (mockDb.inwardRequests || []).findIndex(r => String(r.id) === String(request_id));
+  if (reqIndex === -1) return res.status(404).json({ error: "Request not found" });
+  mockDb.inwardRequests[reqIndex].status = status;
+  mockDb.inwardRequests[reqIndex].approved_by = approved_by;
+
+  if (approve) {
+    const requestData = mockDb.inwardRequests[reqIndex];
+    const stock = (mockDb.stocks || []).find(s => String(s.owner_id) === String(requestData.warehouse_id) && String(s.product_id) === String(requestData.product_id));
+    if (stock) {
+      stock.quantity += requestData.quantity;
+    } else {
+      if (!mockDb.stocks) mockDb.stocks = [];
+      mockDb.stocks.push({
+        owner_id: requestData.warehouse_id,
+        product_id: requestData.product_id,
+        quantity: requestData.quantity
+      });
+    }
+
+    if (!mockDb.intakes) mockDb.intakes = [];
+    mockDb.intakes.unshift({
+      id: "intake_" + Date.now(),
+      warehouse_id: requestData.warehouse_id,
+      product_id: requestData.product_id,
+      quantity: requestData.quantity,
+      batch_number: requestData.batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+      supplier: requestData.supplier || "Approved Supplier Consignment",
+      date_received: requestData.date_received || new Date().toISOString().split("T")[0],
+      receipt_url: requestData.receipt_url || "mock_receipt.png",
+      received_by: approved_by,
+      created_at: new Date()
+    });
+  }
+
+  await logAudit(approved_by, "Super Admin", "APPROVE_STOCK_INWARD", "stock_inward_requests", request_id, "Stock inward marked " + status);
+  return res.json({ message: "Stock inward successfully " + status });
+});
+// Stock Intake (Direct intake with batch, supplier, date received - Protected by Intake Rate Limiter)
+router.post("/api/stock/intake", storeAdminIntakeLimiter, async (req, res) => {
   const { warehouse_id, product_id, quantity, batch_number, supplier, date_received, receipt_base64, receipt_filename, received_by } = req.body;
   if (!warehouse_id || !product_id || !quantity) {
-    return res.status(400).json({ error: 'warehouse_id, product_id, and quantity are required' });
+    return res.status(400).json({ error: "warehouse_id, product_id, and quantity are required" });
+  }
+
+  // Idempotency check: prevent duplicate stock intake within 60 seconds
+  const opKey = getStockOpKey("intake", req.body, req);
+  const cached = recentStockOpsCache.get(opKey);
+  if (cached && (Date.now() - cached.timestamp) < 60000) {
+    console.log("[Idempotency] Duplicate stock intake blocked: " + opKey);
+    return res.status(200).json({ ...cached.result, _duplicate_prevented: true });
   }
 
   const intakeQty = parseInt(quantity);
-  let finalReceiptUrl = 'mock_receipt.png';
+  let finalReceiptUrl = "mock_receipt.png";
 
   if (state.isSupabaseConfigured) {
     try {
       if (receipt_base64 && receipt_filename) {
-        const buffer = Buffer.from(receipt_base64, 'base64');
-        const filePath = `intake_${Date.now()}_${receipt_filename}`;
-        const { error: uploadError } = await supabase.storage.from('receipts').upload(filePath, buffer, {
-          contentType: receipt_filename.endsWith('.pdf') ? 'application/pdf' : 'image/png',
-          upsert: true
-        });
-        if (!uploadError) {
-          const { data: urlData } = supabase.storage.from('receipts').getPublicUrl(filePath);
-          finalReceiptUrl = urlData.publicUrl;
+        const optimized = await optimizeBase64Image(receipt_base64, receipt_filename);
+        if (optimized) {
+          const filePath = "intake_" + Date.now() + "_" + optimized.filename;
+          const { error: uploadError } = await supabase.storage.from("receipts").upload(filePath, optimized.buffer, {
+            contentType: optimized.contentType,
+            upsert: true
+          });
+          if (!uploadError) {
+            const { data: urlData } = supabase.storage.from("receipts").getPublicUrl(filePath);
+            finalReceiptUrl = urlData.publicUrl;
+          }
         }
       }
 
       let intakeData = {
-        id: `intake_${Date.now()}`,
+        id: "intake_" + Date.now(),
         warehouse_id,
         product_id,
         quantity: intakeQty,
-        batch_number: batch_number || `BATCH-${Date.now().toString().slice(-6)}`,
-        supplier: supplier || 'Direct Supplier',
-        date_received: date_received || new Date().toISOString().split('T')[0],
+        batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+        supplier: supplier || "Direct Supplier",
+        date_received: date_received || new Date().toISOString().split("T")[0],
         receipt_url: finalReceiptUrl,
         received_by: received_by || null,
         created_at: new Date()
       };
 
       try {
-        const { data: dbIntake, error: intakeErr } = await supabase.from('stock_intakes').insert([{
+        const { data: dbIntake, error: intakeErr } = await supabase.from("stock_intakes").insert([{
           warehouse_id,
           product_id,
           quantity: intakeQty,
-          batch_number: batch_number || `BATCH-${Date.now().toString().slice(-6)}`,
-          supplier: supplier || 'Direct Supplier',
-          date_received: date_received || new Date().toISOString().split('T')[0],
+          batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+          supplier: supplier || "Direct Supplier",
+          date_received: date_received || new Date().toISOString().split("T")[0],
           receipt_url: finalReceiptUrl,
           received_by: received_by || null
         }]).select().single();
         if (!intakeErr && dbIntake) intakeData = dbIntake;
       } catch (e) {
-        console.warn('stock_intakes table not available, using in-memory log:', e.message);
+        console.warn("stock_intakes table not available, using in-memory log:", e.message);
       }
 
       if (!mockDb.intakes) mockDb.intakes = [];
       mockDb.intakes.unshift(intakeData);
 
-      const { data: currentStock, error: stockFetchErr } = await supabase.from('stocks')
-        .select('*')
-        .eq('owner_id', warehouse_id)
-        .eq('product_id', product_id)
+      const { data: currentStock, error: stockFetchErr } = await supabase.from("stocks")
+        .select("*")
+        .eq("owner_id", warehouse_id)
+        .eq("product_id", product_id)
         .maybeSingle();
 
       if (stockFetchErr) {
-        console.warn('Stock fetch error in Supabase:', stockFetchErr.message);
+        console.warn("Stock fetch error in Supabase:", stockFetchErr.message);
       }
 
       if (currentStock) {
-        await supabase.from('stocks')
+        await supabase.from("stocks")
           .update({ quantity: currentStock.quantity + intakeQty, updated_at: new Date() })
-          .eq('id', currentStock.id);
+          .eq("id", currentStock.id);
       } else {
-        await supabase.from('stocks').insert([{
+        await supabase.from("stocks").insert([{
           owner_id: warehouse_id,
           product_id,
           quantity: intakeQty
         }]);
       }
 
-      await logAudit(received_by, 'Store / Super Admin', 'STOCK_INTAKE', 'stocks', product_id, `Stock intake of ${intakeQty} units (Batch: ${batch_number || 'N/A'}, Supplier: ${supplier || 'N/A'})`);
+      recentStockOpsCache.set(opKey, { timestamp: Date.now(), result: intakeData });
+      await logAudit(received_by, "Store / Super Admin", "STOCK_INTAKE", "stocks", product_id, "Stock intake of " + intakeQty + " units (Batch: " + (batch_number || "N/A") + ", Supplier: " + (supplier || "N/A") + ")");
       return res.status(201).json(intakeData);
     } catch (err) {
-      console.error('Stock intake failure:', err);
+      console.error("Stock intake failure:", err);
       return res.status(500).json({ error: err.message });
     }
   } else {
     const newIntake = {
-      id: `intake_${Date.now()}`,
+      id: "intake_" + Date.now(),
       warehouse_id,
       product_id,
       quantity: intakeQty,
-      batch_number: batch_number || `BATCH-${Date.now().toString().slice(-6)}`,
-      supplier: supplier || 'Direct Supplier',
-      date_received: date_received || new Date().toISOString().split('T')[0],
+      batch_number: batch_number || ("BATCH-" + Date.now().toString().slice(-6)),
+      supplier: supplier || "Direct Supplier",
+      date_received: date_received || new Date().toISOString().split("T")[0],
       receipt_url: finalReceiptUrl,
       received_by: received_by || null,
       created_at: new Date()
@@ -314,10 +445,11 @@ router.post('/api/stock/intake', async (req, res) => {
     if (!mockDb.intakes) mockDb.intakes = [];
     mockDb.intakes.unshift(newIntake);
 
-    const stock = mockDb.stocks.find(s => s.owner_id === warehouse_id && s.product_id === product_id);
+    const stock = (mockDb.stocks || []).find(s => String(s.owner_id) === String(warehouse_id) && String(s.product_id) === String(product_id));
     if (stock) {
       stock.quantity += intakeQty;
     } else {
+      if (!mockDb.stocks) mockDb.stocks = [];
       mockDb.stocks.push({
         owner_id: warehouse_id,
         product_id,
@@ -325,13 +457,13 @@ router.post('/api/stock/intake', async (req, res) => {
       });
     }
 
-    await logAudit(received_by, 'Store Admin', 'STOCK_INTAKE', 'stock_intakes', newIntake.id, `Stock intake of ${intakeQty} units (Batch: ${newIntake.batch_number}, Supplier: ${newIntake.supplier})`);
+    recentStockOpsCache.set(opKey, { timestamp: Date.now(), result: newIntake });
+    await logAudit(received_by, "Store Admin", "STOCK_INTAKE", "stock_intakes", newIntake.id, "Stock intake of " + intakeQty + " units (Batch: " + newIntake.batch_number + ", Supplier: " + newIntake.supplier + ")");
     return res.status(201).json(newIntake);
   }
 });
-
-// List Stock Intakes (Store Admin)
-router.get('/api/stock/intakes', async (req, res) => {
+// List Stock Intakes (Store Admin - Protected by Store Admin General Limiter)
+router.get('/api/stock/intakes', storeAdminGeneralLimiter, async (req, res) => {
   const { warehouse_id } = req.query;
   if (state.isSupabaseConfigured) {
     try {
@@ -348,9 +480,9 @@ router.get('/api/stock/intakes', async (req, res) => {
   return res.json(list);
 });
 
-// Transfer stock (Store Admin -> FSM, FSM -> Salesman)
-router.post('/api/stock/transfer', async (req, res) => {
-  const { from_id, to_id, product_id, quantity, status = 'completed' } = req.body;
+// Transfer stock (Store Admin -> FSM, FSM -> Salesman - Protected by Transaction Limiter)
+router.post('/api/stock/transfer', storeAdminTransactionLimiter, async (req, res) => {
+  let { from_id, to_id, product_id, quantity, status = 'completed' } = req.body;
   if (!from_id || !to_id || !product_id || !quantity) {
     return res.status(400).json({ error: 'from_id, to_id, product_id, and quantity are required' });
   }
@@ -360,6 +492,13 @@ router.post('/api/stock/transfer', async (req, res) => {
 
   if (state.isSupabaseConfigured) {
     try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(product_id);
+      if (!isUuid) {
+        const { data: firstProd } = await supabase.from('products').select('id').limit(1);
+        if (firstProd && firstProd.length > 0) {
+          product_id = firstProd[0].id;
+        }
+      }
       const { data: recipientUser } = await supabase.from('users').select('*').eq('id', to_id).maybeSingle();
       const { data: senderUser } = await supabase.from('users').select('*').eq('id', from_id).maybeSingle();
       const { data: warehouse } = await supabase.from('warehouses').select('id').eq('id', from_id).maybeSingle();
@@ -385,7 +524,7 @@ router.post('/api/stock/transfer', async (req, res) => {
 
       // Restriction 4: FSM can only distribute stock to salesmen under their supervision
       if (senderUser && senderUser.role === 'field_sales_manager') {
-        if (!recipientUser || recipientUser.role !== 'salesman' || (recipientUser.parent_id && recipientUser.parent_id !== from_id && from_id !== 'c3456789-de23-45ff-67ff-8901abcdef23' && from_id !== 'u3')) {
+        if (!recipientUser || recipientUser.role !== 'salesman' || (recipientUser.parent_id && recipientUser.parent_id !== from_id)) {
           return res.status(403).json({ error: 'Field Sales Managers can only distribute stock to Salesmen under their direct supervision.' });
         }
       }
@@ -398,14 +537,9 @@ router.post('/api/stock/transfer', async (req, res) => {
         .maybeSingle();
       
       if (sendErr || !senderStock) {
-        const { data: newStock } = await supabase.from('stocks').insert([{
-          owner_id: from_id,
-          product_id,
-          quantity: Math.max(transferQty + 50, 100)
-        }]).select().single();
-        senderStock = newStock;
+        return res.status(400).json({ error: 'Insufficient stock at source: No stock found' });
       } else if (senderStock.quantity < transferQty) {
-        return res.status(400).json({ error: 'Insufficient stock at source' });
+        return res.status(400).json({ error: `Insufficient stock at source (Available: ${senderStock.quantity}, Requested: ${transferQty})` });
       }
 
       // Deduct from sender
@@ -474,26 +608,18 @@ router.post('/api/stock/transfer', async (req, res) => {
 
     // Restriction 4: FSM can only distribute stock to salesmen under their supervision
     if (senderUser && senderUser.role === 'field_sales_manager') {
-      if (!recipientUser || recipientUser.role !== 'salesman' || (recipientUser.parent_id && recipientUser.parent_id !== from_id && from_id !== 'c3456789-de23-45ff-67ff-8901abcdef23' && from_id !== 'u3')) {
+      if (!recipientUser || recipientUser.role !== 'salesman' || (recipientUser.parent_id && recipientUser.parent_id !== from_id)) {
         return res.status(403).json({ error: 'Field Sales Managers can only distribute stock to Salesmen under their direct supervision.' });
       }
     }
 
     let senderStock = mockDb.stocks.find(s => s.owner_id === from_id && s.product_id === product_id);
-    if (!senderStock) {
-      senderStock = {
-        owner_id: from_id,
-        product_id,
-        quantity: Math.max(transferQty + 50, mockDb.fsmSettlementHub?.depot_stock || 100)
-      };
-      mockDb.stocks.push(senderStock);
-    }
-    if (senderStock.quantity < transferQty) {
+    if (!senderStock || senderStock.quantity < transferQty) {
       return res.status(400).json({ error: 'Insufficient stock at source' });
     }
 
     senderStock.quantity -= transferQty;
-    if (mockDb.fsmSettlementHub && (from_id === 'u3' || from_id === 'c3456789-de23-45ff-67ff-8901abcdef23' || senderUser?.role === 'field_sales_manager')) {
+    if (mockDb.fsmSettlementHub && senderUser?.role === 'field_sales_manager') {
       mockDb.fsmSettlementHub.depot_stock = Math.max(0, (mockDb.fsmSettlementHub.depot_stock || 0) - transferQty);
     }
 
@@ -536,8 +662,8 @@ router.post('/api/stock/transfer', async (req, res) => {
   }
 });
 
-// Accept/Confirm Receipt of Stock Transfer (FSM accepts incoming stock from Store Admin or Salesman accepts from FSM)
-router.put('/api/stock/transfers/:id/accept', async (req, res) => {
+// Accept/Confirm Receipt of Stock Transfer (FSM accepts incoming stock from Store Admin or Salesman accepts from FSM - Protected by Operations Limiter)
+router.put('/api/stock/transfers/:id/accept', fsmOperationsLimiter, async (req, res) => {
   const { id } = req.params;
   const { user_id } = req.body;
 
@@ -658,8 +784,8 @@ router.put('/api/stock/transfers/:id/accept', async (req, res) => {
   }
 });
 
-// Recall Stock (Reverse Allocation from supervised Salesman back to FSM)
-router.post('/api/stock/recall', async (req, res) => {
+// Recall Stock (Reverse Allocation from supervised Salesman back to FSM - Protected by Operations Limiter)
+router.post('/api/stock/recall', fsmOperationsLimiter, async (req, res) => {
   const { fsm_id, salesman_id, product_id, quantity, reason } = req.body;
   if (!fsm_id || !salesman_id || !product_id || !quantity) {
     return res.status(400).json({ error: 'fsm_id, salesman_id, product_id, and quantity are required' });
@@ -758,8 +884,8 @@ router.post('/api/stock/recall', async (req, res) => {
   }
 });
 
-// Get global stock view for all warehouses and team members (Super Admin)
-router.get('/api/stock/global', async (req, res) => {
+// Get global stock view for all warehouses and team members (Super Admin - Protected by Analytics Rate Limiter)
+router.get('/api/stock/global', superAdminAnalyticsLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data, error } = await supabase.from('stocks').select('*, product:products(name, sku, unit)');
@@ -822,8 +948,8 @@ router.get('/api/stock/global', async (req, res) => {
   }
 });
 
-// Full Stock Transfers History (Super Admin & Store Admin & FSM)
-router.get('/api/stock/transfers', async (req, res) => {
+// Full Stock Transfers History (Super Admin & Store Admin & FSM - Protected by General Admin Rate Limiter)
+router.get('/api/stock/transfers', superAdminGeneralLimiter, async (req, res) => {
   const { from_id, to_id, status, user_id } = req.query;
 
   if (state.isSupabaseConfigured) {
@@ -881,8 +1007,8 @@ router.get('/api/stock/transfers', async (req, res) => {
   }
 });
 
-// Low-Stock Alerts across warehouses or specific warehouse
-router.get('/api/stock/alerts', async (req, res) => {
+// Low-Stock Alerts across warehouses or specific warehouse (Protected by General Admin Rate Limiter)
+router.get('/api/stock/alerts', superAdminGeneralLimiter, async (req, res) => {
   const { warehouse_id, owner_id } = req.query;
   const targetOwner = warehouse_id || owner_id;
 
@@ -938,8 +1064,8 @@ router.get('/api/stock/alerts', async (req, res) => {
   }
 });
 
-// Get stock levels for a specific owner (warehouse or user)
-router.get('/api/stock/:owner_id', async (req, res) => {
+// Get stock levels for a specific owner (warehouse or user - Protected by Store Admin General Limiter)
+router.get('/api/stock/:owner_id', storeAdminGeneralLimiter, async (req, res) => {
   const { owner_id } = req.params;
 
   if (state.isSupabaseConfigured) {

@@ -23,7 +23,40 @@ const mockDb = {
     { role: 'salesman', permission_key: 'onboard_customer', is_allowed: true }
   ],
   customers: [],
-  userRequests: [],
+  userRequests: [
+    {
+      id: 'req_seed_101',
+      name: 'Rajesh Sharma',
+      email: 'salesman.rajesh.sharma@erp.internal',
+      phone: '+91 98765 43210',
+      role: 'salesman',
+      warehouse_id: 'w1',
+      parent_id: 'c3456789-de23-45ff-67ff-8901abcdef23',
+      requested_by: 'd4567890-ef34-56ff-78ff-9012abcdef34',
+      status: 'pending',
+      requires_password_setup: true,
+      password: 'Sales#2026Password',
+      aadhaar_number: '5489 1234 8901',
+      kyc_doc: '',
+      created_at: new Date(Date.now() - 3600000 * 4).toISOString()
+    },
+    {
+      id: 'req_seed_102',
+      name: 'Amit Kulkarni',
+      email: 'fsm.amit.kulkarni@erp.internal',
+      phone: '+91 98765 43215',
+      role: 'field_sales_manager',
+      warehouse_id: 'w2',
+      parent_id: 'b2345678-cd12-34ef-56df-7890abcdef12',
+      requested_by: 'b2345678-cd12-34ef-56df-7890abcdef12',
+      status: 'pending',
+      requires_password_setup: true,
+      password: 'Fsm#2026Password',
+      aadhaar_number: '6321 9845 1024',
+      kyc_doc: '',
+      created_at: new Date(Date.now() - 3600000 * 2).toISOString()
+    }
+  ],
   products: [
     { id: 'p1', name: 'Premium 20L Water Jar', sku: 'WTR-20L', unit: 'jar', category: 'Beverages', base_price: 300, min_stock_alert: 25, store_admin_commission: 5.0, fsm_commission: 10.0, salesman_commission: 50.0, referral_commission: 10.0, initial_stock_quota: 100, commission_slabs: [{ from_qty: 101, to_qty: 110, added_commission: 5.0, label: 'Tier 1 (+₹5)' }, { from_qty: 111, to_qty: 130, added_commission: 10.0, label: 'Tier 2 (+₹10)' }] },
     { id: 'p2', name: '1L Mineral Water Box (12 Bottles)', sku: 'WTR-1L-BOX', unit: 'box', category: 'Beverages', base_price: 240, min_stock_alert: 15, store_admin_commission: 4.0, fsm_commission: 8.0, salesman_commission: 40.0, referral_commission: 8.0, initial_stock_quota: 100, commission_slabs: [{ from_qty: 101, to_qty: 110, added_commission: 4.0, label: 'Tier 1 (+₹4)' }, { from_qty: 111, to_qty: 130, added_commission: 8.0, label: 'Tier 2 (+₹8)' }] },

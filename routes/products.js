@@ -5,9 +5,10 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { productMeta, saveProductMeta } = require('../services/productMeta');
+const { superAdminGeneralLimiter, superAdminSensitiveLimiter } = require('../services/rateLimiter');
 
 // List Products
-router.get('/api/products', async (req, res) => {
+router.get('/api/products', superAdminGeneralLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data, error } = await supabase.from('products').select('*');
@@ -25,7 +26,7 @@ router.get('/api/products', async (req, res) => {
           fsm_commission: meta.fsm_commission !== undefined ? meta.fsm_commission : (p.fsm_commission !== undefined ? parseFloat(p.fsm_commission) : 0.0),
           salesman_commission: meta.salesman_commission !== undefined ? meta.salesman_commission : (p.salesman_commission !== undefined ? parseFloat(p.salesman_commission) : 0.0),
           referral_commission: meta.referral_commission !== undefined ? meta.referral_commission : (p.referral_commission !== undefined ? parseFloat(p.referral_commission) : 0.0),
-          initial_stock_quota: meta.initial_stock_quota !== undefined ? meta.initial_stock_quota : (p.initial_stock_quota !== undefined ? parseInt(p.initial_stock_quota) : 100),
+          initial_stock_quota: meta.initial_stock_quota !== undefined ? meta.initial_stock_quota : (p.initial_stock_quota !== undefined ? parseInt(p.initial_stock_quota) : 0),
           commission_slabs: meta.commission_slabs || p.commission_slabs || []
         };
       });
@@ -46,7 +47,7 @@ router.get('/api/products', async (req, res) => {
         fsm_commission: meta.fsm_commission !== undefined ? meta.fsm_commission : (p.fsm_commission !== undefined ? p.fsm_commission : 0.0),
         salesman_commission: meta.salesman_commission !== undefined ? meta.salesman_commission : (p.salesman_commission !== undefined ? p.salesman_commission : 0.0),
         referral_commission: meta.referral_commission !== undefined ? meta.referral_commission : (p.referral_commission !== undefined ? p.referral_commission : 0.0),
-        initial_stock_quota: meta.initial_stock_quota !== undefined ? meta.initial_stock_quota : (p.initial_stock_quota !== undefined ? parseInt(p.initial_stock_quota) : 100),
+        initial_stock_quota: meta.initial_stock_quota !== undefined ? meta.initial_stock_quota : (p.initial_stock_quota !== undefined ? parseInt(p.initial_stock_quota) : 0),
         commission_slabs: meta.commission_slabs || p.commission_slabs || []
       };
     }));
@@ -54,7 +55,7 @@ router.get('/api/products', async (req, res) => {
 });
 
 // Add Product (Super Admin)
-router.post('/api/products', async (req, res) => {
+router.post('/api/products', superAdminSensitiveLimiter, async (req, res) => {
   const {
     name, sku, unit, category, base_price, min_stock_alert, image_url, is_active,
     store_admin_commission, fsm_commission, salesman_commission, referral_commission,
@@ -68,7 +69,7 @@ router.post('/api/products', async (req, res) => {
   const fsmComm = fsm_commission !== undefined ? parseFloat(fsm_commission) : 0.0;
   const salesmanComm = salesman_commission !== undefined ? parseFloat(salesman_commission) : 0.0;
   const referralComm = referral_commission !== undefined ? parseFloat(referral_commission) : 0.0;
-  const initStock = initial_stock_quota !== undefined ? parseInt(initial_stock_quota) : 100;
+  const initStock = initial_stock_quota !== undefined ? parseInt(initial_stock_quota) : 0;
   const slabs = Array.isArray(commission_slabs) ? commission_slabs : [];
 
   if (state.isSupabaseConfigured) {
@@ -163,7 +164,7 @@ router.post('/api/products', async (req, res) => {
 });
 
 // Update Product (Super Admin)
-router.put('/api/products/:id', async (req, res) => {
+router.put('/api/products/:id', superAdminGeneralLimiter, async (req, res) => {
   const { id } = req.params;
   const {
     name, sku, unit, category, base_price, min_stock_alert, image_url, is_active,
@@ -217,7 +218,7 @@ router.put('/api/products/:id', async (req, res) => {
       if (fsm_commission !== undefined) productMeta[id].fsm_commission = parseFloat(fsm_commission);
       if (salesman_commission !== undefined) productMeta[id].salesman_commission = parseFloat(salesman_commission);
       if (referral_commission !== undefined) productMeta[id].referral_commission = parseFloat(referral_commission);
-      if (initial_stock_quota !== undefined) productMeta[id].initial_stock_quota = parseInt(initial_stock_quota) || 100;
+      if (initial_stock_quota !== undefined) productMeta[id].initial_stock_quota = parseInt(initial_stock_quota) || 0;
       if (commission_slabs !== undefined) productMeta[id].commission_slabs = Array.isArray(commission_slabs) ? commission_slabs : [];
       saveProductMeta();
 
@@ -245,7 +246,7 @@ router.put('/api/products/:id', async (req, res) => {
     if (fsm_commission !== undefined) prod.fsm_commission = parseFloat(fsm_commission);
     if (salesman_commission !== undefined) prod.salesman_commission = parseFloat(salesman_commission);
     if (referral_commission !== undefined) prod.referral_commission = parseFloat(referral_commission);
-    if (initial_stock_quota !== undefined) prod.initial_stock_quota = parseInt(initial_stock_quota) || 100;
+    if (initial_stock_quota !== undefined) prod.initial_stock_quota = parseInt(initial_stock_quota) || 0;
     if (commission_slabs !== undefined) prod.commission_slabs = Array.isArray(commission_slabs) ? commission_slabs : [];
 
     productMeta[id] = productMeta[id] || {};
@@ -258,7 +259,7 @@ router.put('/api/products/:id', async (req, res) => {
     if (fsm_commission !== undefined) productMeta[id].fsm_commission = parseFloat(fsm_commission);
     if (salesman_commission !== undefined) productMeta[id].salesman_commission = parseFloat(salesman_commission);
     if (referral_commission !== undefined) productMeta[id].referral_commission = parseFloat(referral_commission);
-    if (initial_stock_quota !== undefined) productMeta[id].initial_stock_quota = parseInt(initial_stock_quota) || 100;
+    if (initial_stock_quota !== undefined) productMeta[id].initial_stock_quota = parseInt(initial_stock_quota) || 0;
     if (commission_slabs !== undefined) productMeta[id].commission_slabs = Array.isArray(commission_slabs) ? commission_slabs : [];
     saveProductMeta();
 
@@ -271,7 +272,7 @@ router.put('/api/products/:id', async (req, res) => {
 });
 
 // Delete Product (Super Admin)
-router.delete('/api/products/:id', async (req, res) => {
+router.delete('/api/products/:id', superAdminSensitiveLimiter, async (req, res) => {
   const { id } = req.params;
   const { admin_id, admin_name } = req.query;
 
@@ -310,7 +311,7 @@ router.delete('/api/products/:id', async (req, res) => {
 });
 
 // Get all product prices (Super Admin)
-router.get('/api/products/prices', async (req, res) => {
+router.get('/api/products/prices', superAdminGeneralLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data, error } = await supabase.from('product_prices').select('*, product:products(name, sku)');
@@ -329,7 +330,7 @@ router.get('/api/products/prices', async (req, res) => {
 });
 
 // Configure or update price for a product and role (Super Admin)
-router.post('/api/products/prices', async (req, res) => {
+router.post('/api/products/prices', superAdminGeneralLimiter, async (req, res) => {
   const { product_id, role, price, discount_percentage, admin_id, admin_name } = req.body;
   if (!product_id || !role || price === undefined) {
     return res.status(400).json({ error: 'product_id, role, and price are required' });

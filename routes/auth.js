@@ -13,9 +13,10 @@ const {
   recordSuccessfulLogin,
   MAX_ACCOUNT_ATTEMPTS
 } = require('../services/authService');
+const { authGeneralLimiter } = require('../services/rateLimiter');
 
-// Check worker status (For first-time account activation)
-router.post('/api/auth/check-status', async (req, res) => {
+// Check worker status (For first-time account activation - Protected by Auth Limiter)
+router.post('/api/auth/check-status', authGeneralLimiter, async (req, res) => {
   const { identifier } = req.body;
   const loginId = (identifier || '').trim();
   if (!loginId) return res.status(400).json({ error: 'Please enter your mobile number or email.' });
@@ -78,8 +79,8 @@ router.post('/api/auth/check-status', async (req, res) => {
   });
 });
 
-// Setup Initial Password (First-Time Login Activation)
-router.post('/api/auth/setup-password', async (req, res) => {
+// Setup Initial Password (First-Time Login Activation - Protected by Auth Limiter)
+router.post('/api/auth/setup-password', authGeneralLimiter, async (req, res) => {
   const { identifier, password } = req.body;
   const loginId = (identifier || '').trim();
   const newPass = (password || '').trim();

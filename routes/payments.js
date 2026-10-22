@@ -1,13 +1,85 @@
 const express = require('express');
 const router = express.Router();
+const { supabaseAdmin: supabase } = require('../db');
 const mockDb = require('../data/mockDb');
+const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
+const { superAdminAnalyticsLimiter, superAdminSensitiveLimiter } = require('../services/rateLimiter');
 
-// Payments & Transactions History (Super Admin)
-router.get('/api/payments', async (req, res) => {
+// Payments & Transactions History (Super Admin - Protected by Analytics Limiter)
+router.get('/api/payments', superAdminAnalyticsLimiter, async (req, res) => {
   const { type, method, status, search, start_date, end_date } = req.query;
 
   let allPayments = [...(mockDb.payments || [])];
+
+  // Harvest from live Supabase tables if configured
+  if (state.isSupabaseConfigured) {
+    try {
+      const [{ data: dbSales }, { data: dbSettlements }, { data: dbUsers }, { data: dbProducts }, { data: dbCustomers }] = await Promise.all([
+        supabase.from('sales').select('*').order('created_at', { ascending: false }),
+        supabase.from('settlements').select('*').order('created_at', { ascending: false }),
+        supabase.from('users').select('id, name, phone, role'),
+        supabase.from('products').select('id, name'),
+        supabase.from('customers').select('id, name, phone')
+      ]);
+
+      const userMap = new Map((dbUsers || []).map(u => [u.id, u]));
+      const prodMap = new Map((dbProducts || []).map(p => [p.id, p]));
+      const custMap = new Map((dbCustomers || []).map(c => [c.id, c]));
+
+      (dbSales || []).forEach(s => {
+        if (!allPayments.some(p => p.reference_id === s.id)) {
+          const prod = prodMap.get(s.product_id);
+          const cust = custMap.get(s.customer_id);
+          const user = userMap.get(s.salesman_id);
+          allPayments.push({
+            id: `pay_${s.id}`,
+            payment_no: `PAY-SAL-${s.id.toString().slice(-5).toUpperCase()}`,
+            type: 'sale',
+            category: s.customer_type === 'distributor' ? 'Wholesale Bulk Sale' : 'Retail Customer Sale',
+            amount: parseFloat(s.amount) || 0,
+            payment_method: s.payment_method || 'online',
+            status: 'completed',
+            payer_name: cust?.name || s.customer_name || 'Walk-in Customer',
+            payer_phone: cust?.phone || s.customer_phone || '',
+            payer_type: s.customer_type || 'retail',
+            collector_name: user?.name || 'Staff Member',
+            collector_role: user?.role || 'salesman',
+            item_description: `${s.quantity}x ${prod?.name || 'Bottles'}`,
+            reference_id: s.id,
+            notes: s.referral_code ? `Referral code used: ${s.referral_code}` : 'Order payment received',
+            created_at: s.created_at || new Date().toISOString()
+          });
+        }
+      });
+
+      (dbSettlements || []).forEach(stl => {
+        if (!allPayments.some(p => p.reference_id === stl.id)) {
+          const u = userMap.get(stl.salesman_id);
+          allPayments.push({
+            id: `pay_${stl.id}`,
+            payment_no: `PAY-STL-${stl.id.toString().slice(-5).toUpperCase()}`,
+            type: 'settlement',
+            category: 'Daily Cash Settlement',
+            amount: parseFloat(stl.cash_collected || stl.sold_amount || 0),
+            payment_method: 'cash',
+            status: (stl.status === 'settled' || stl.status === 'tally_zero') ? 'completed' : 'pending',
+            payer_name: u ? `${u.name} (Salesman)` : (stl.salesman_name || 'Salesman Deposit'),
+            payer_phone: u?.phone || '',
+            payer_type: 'salesman',
+            collector_name: stl.fsm_name || 'Field Sales Manager / Depot',
+            collector_role: 'manager',
+            item_description: `Evening Cash Handover (${stl.bottles_sold || 0} btls sold)`,
+            reference_id: stl.id,
+            notes: `Difference: ₹${stl.difference || 0}`,
+            created_at: stl.created_at || new Date().toISOString()
+          });
+        }
+      });
+    } catch (e) {
+      console.warn('Supabase payments query notice:', e.message);
+    }
+  }
 
   // Harvest from mockDb.sales
   const salesList = mockDb.sales || [];
@@ -139,8 +211,8 @@ router.get('/api/payments', async (req, res) => {
   });
 });
 
-// Record Manual Payment Entry (Super Admin)
-router.post('/api/payments', async (req, res) => {
+// Record Manual Payment Entry (Super Admin - Protected by Sensitive Limiter)
+router.post('/api/payments', superAdminSensitiveLimiter, async (req, res) => {
   const {
     payer_name,
     payer_phone,

@@ -5,9 +5,11 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getDefaultProductUnitPrice } = require('../services/productMeta');
+const { optimizeBase64Image } = require('../services/imageOptimizer');
+const { fsmGeneralLimiter, fsmOperationsLimiter, salesmanGeneralLimiter } = require('../services/rateLimiter');
 
-// Daily Settlements (List, Create, Approve for Salesman & FSM)
-router.get('/api/settlements', async (req, res) => {
+// Daily Settlements (List, Create, Approve for Salesman & FSM - Protected by General FSM Limiter)
+router.get('/api/settlements', fsmGeneralLimiter, async (req, res) => {
   const { salesman_id, fsm_id, status } = req.query;
 
   let list = [];
@@ -32,14 +34,14 @@ router.get('/api/settlements', async (req, res) => {
       list = list.filter(s => s.salesman_id === salesman_id);
     }
     if (fsm_id) {
-      list = list.filter(s => s.fsm_id === fsm_id || s.fsm_id === 'c3456789-de23-45ff-67ff-8901abcdef23' || s.fsm_id === 'u3');
+      list = list.filter(s => s.fsm_id === fsm_id);
     }
     if (status && status !== 'all') {
       list = list.filter(s => s.status === status);
     }
   }
   if (fsm_id) {
-    list = list.filter(s => s.fsm_id === fsm_id || s.fsm_id === 'c3456789-de23-45ff-67ff-8901abcdef23' || s.fsm_id === 'u3');
+    list = list.filter(s => s.fsm_id === fsm_id);
   }
   if (status && status !== 'all') {
     list = list.filter(s => s.status === status);
@@ -54,9 +56,17 @@ router.get('/api/settlements', async (req, res) => {
   return res.json(enriched);
 });
 
-// Single settlement by ID
-router.get('/api/settlement/:id', (req, res) => {
+// Single settlement by ID (Polling protected by Salesman General Limiter)
+router.get('/api/settlement/:id', salesmanGeneralLimiter, async (req, res) => {
   const { id } = req.params;
+  if (state.isSupabaseConfigured) {
+    try {
+      const { data, error } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
+      if (!error && data) {
+        return res.json(data);
+      }
+    } catch (_) {}
+  }
   const item = (mockDb.settlements || []).find(s => s.id === id);
   if (!item) return res.status(404).json({ error: 'Settlement not found' });
   return res.json(item);
@@ -66,7 +76,14 @@ const approveSettlementHandler = async (req, res) => {
   const { id } = req.params;
   const { approved_by, fsm_id } = req.body || {};
 
-  const item = (mockDb.settlements || []).find(s => s.id === id);
+  let item = (mockDb.settlements || []).find(s => s.id === id);
+  if (!item && state.isSupabaseConfigured) {
+    try {
+      const { data } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
+      if (data) item = data;
+    } catch (_) {}
+  }
+
   if (!item) {
     return res.status(404).json({ error: 'Settlement not found' });
   }
@@ -124,15 +141,28 @@ const approveSettlementHandler = async (req, res) => {
   // If Supabase is connected, update DB tables
   if (state.isSupabaseConfigured) {
     try {
-      const { data: smStock } = await supabase.from('stocks').select('*').eq('user_id', item.salesman_id).maybeSingle();
-      if (smStock) {
-        const updatedQty = Math.max(0, (smStock.quantity || 0) - totalSettledBottles);
-        await supabase.from('stocks').update({ quantity: updatedQty }).eq('id', smStock.id);
+      // 1. Update settlement record status in database
+      await supabase.from('settlements').update({
+        status: 'settled',
+        difference: 0
+      }).eq('id', id);
+
+      // 2. Deduct from salesman stock (owner_id in stocks table)
+      if (item.salesman_id) {
+        const { data: smStock } = await supabase.from('stocks').select('*').eq('owner_id', item.salesman_id).maybeSingle();
+        if (smStock) {
+          const updatedQty = Math.max(0, (smStock.quantity || 0) - totalSettledBottles);
+          await supabase.from('stocks').update({ quantity: updatedQty }).eq('id', smStock.id);
+        }
       }
-      const targetFsmId = item.fsm_id || fsm_id || 'c3456789-de23-45ff-67ff-8901abcdef23';
-      const { data: fsmStock } = await supabase.from('stocks').select('*').eq('user_id', targetFsmId).maybeSingle();
-      if (fsmStock) {
-        await supabase.from('stocks').update({ quantity: (fsmStock.quantity || 0) + returnedQty }).eq('id', fsmStock.id);
+
+      // 3. Credit returned stock back to FSM depot
+      const targetFsmId = item.fsm_id || fsm_id;
+      if (targetFsmId) {
+        const { data: fsmStock } = await supabase.from('stocks').select('*').eq('owner_id', targetFsmId).maybeSingle();
+        if (fsmStock) {
+          await supabase.from('stocks').update({ quantity: (fsmStock.quantity || 0) + returnedQty }).eq('id', fsmStock.id);
+        }
       }
     } catch (e) {
       console.warn('Supabase settlement stock sync notice:', e.message);
@@ -140,7 +170,7 @@ const approveSettlementHandler = async (req, res) => {
   }
 
   await logAudit(
-    approved_by || fsm_id || 'u3',
+    approved_by || fsm_id || item.fsm_id || 'system',
     'Field Manager',
     'APPROVE_SETTLEMENT',
     'settlements',
@@ -151,10 +181,11 @@ const approveSettlementHandler = async (req, res) => {
   return res.json(item);
 };
 
-router.put('/api/settlements/:id/approve', approveSettlementHandler);
-router.put('/api/settlements/:id/accept', approveSettlementHandler);
+router.put('/api/settlements/:id/approve', fsmOperationsLimiter, approveSettlementHandler);
+router.put('/api/settlements/:id/accept', fsmOperationsLimiter, approveSettlementHandler);
 
-router.get('/api/settlements/:salesman_id', async (req, res) => {
+// Salesman settlement details (Protected by Salesman General Limiter)
+router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
   const list = (mockDb.settlements || []).filter(s => s.salesman_id === salesman_id);
   const user = mockDb.users.find(u => u.id === salesman_id);
@@ -175,7 +206,8 @@ router.get('/api/settlements/:salesman_id', async (req, res) => {
   });
 });
 
-router.post('/api/settlements', async (req, res) => {
+// Record Settlement (Protected by Operations Limiter)
+router.post('/api/settlements', fsmOperationsLimiter, async (req, res) => {
   const {
     salesman_id,
     salesman_name,
@@ -214,14 +246,16 @@ router.post('/api/settlements', async (req, res) => {
   let finalDamageUrl = damage_image_url || '';
   if (damage_image_base64 && state.isSupabaseConfigured) {
     try {
-      const buffer = Buffer.from(damage_image_base64, 'base64');
-      const filePath = `damage_${Date.now()}_proof.png`;
-      const { error: uploadError } = await supabase.storage
-        .from('receipts')
-        .upload(filePath, buffer, { contentType: 'image/png' });
-      if (!uploadError) {
-        const { data: urlData } = supabase.storage.from('receipts').getPublicUrl(filePath);
-        finalDamageUrl = urlData.publicUrl;
+      const optimized = await optimizeBase64Image(damage_image_base64, 'damage_proof.jpg');
+      if (optimized) {
+        const filePath = `damage_${Date.now()}_${optimized.filename}`;
+        const { error: uploadError } = await supabase.storage
+          .from('receipts')
+          .upload(filePath, optimized.buffer, { contentType: optimized.contentType });
+        if (!uploadError) {
+          const { data: urlData } = supabase.storage.from('receipts').getPublicUrl(filePath);
+          finalDamageUrl = urlData.publicUrl;
+        }
       }
     } catch (e) {
       console.warn('Damage image upload notice:', e.message);
@@ -232,10 +266,10 @@ router.post('/api/settlements', async (req, res) => {
 
   const settlement = {
     id: `stl_${Date.now()}`,
-    salesman_id: salesman_id || 'u4',
-    salesman_name: salesman_name || 'Salesman John',
-    fsm_id: fsm_id || 'c3456789-de23-45ff-67ff-8901abcdef23',
-    fsm_name: fsm_name || 'FSM Alpha',
+    salesman_id: salesman_id || null,
+    salesman_name: salesman_name || 'Salesman',
+    fsm_id: fsm_id || null,
+    fsm_name: fsm_name || 'Field Sales Manager',
     date_label: 'Today',
     bottles_dispatched: dispatched,
     bottles_sold: sold,
@@ -263,7 +297,7 @@ router.post('/api/settlements', async (req, res) => {
 
   if (state.isSupabaseConfigured) {
     try {
-      await supabase.from('settlements').insert([{
+      const { data: insertedDbRow, error: insertErr } = await supabase.from('settlements').insert([{
         salesman_id: salesman_id && salesman_id.length > 20 ? salesman_id : null,
         salesman_name: settlement.salesman_name,
         fsm_id: fsm_id && fsm_id.length > 20 ? fsm_id : null,
@@ -287,7 +321,11 @@ router.post('/api/settlements', async (req, res) => {
         difference,
         status: status || 'pending_fsm',
         security_pin: pin
-      }]);
+      }]).select().maybeSingle();
+
+      if (!insertErr && insertedDbRow && insertedDbRow.id) {
+        settlement.id = insertedDbRow.id;
+      }
     } catch (e) {
       console.warn('settlements Supabase insert notice:', e.message);
     }
@@ -316,7 +354,7 @@ router.post('/api/settlements', async (req, res) => {
   }
 
   await logAudit(
-    salesman_id || 'u4',
+    salesman_id || 'salesman',
     'Salesman',
     'SUBMIT_SETTLEMENT',
     'settlements',

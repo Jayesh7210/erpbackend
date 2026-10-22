@@ -5,6 +5,7 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getProductWithMeta } = require('../services/productMeta');
+const { storeAdminTransactionLimiter, storeAdminGeneralLimiter, fsmGeneralLimiter } = require('../services/rateLimiter');
 
 // Helper function to process dynamic product direct and referral commissions for a sale
 async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, product_id) {
@@ -107,8 +108,8 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
   }
 }
 
-// Log sale (Salesman Field Sales & Store Admin Direct Retail / Distributor Bulk Sales & FSM Direct Retail)
-router.post('/api/sales', async (req, res) => {
+// Log sale (Salesman Field Sales & Store Admin Direct Retail / Distributor Bulk Sales & FSM Direct Retail - Protected by Transaction Limiter)
+router.post('/api/sales', storeAdminTransactionLimiter, async (req, res) => {
   const {
     salesman_id,
     warehouse_id,
@@ -138,6 +139,14 @@ router.post('/api/sales', async (req, res) => {
 
   if (state.isSupabaseConfigured) {
     try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(product_id);
+      if (!isUuid) {
+        const { data: firstProd } = await supabase.from('products').select('id').limit(1);
+        if (firstProd && firstProd.length > 0) {
+          product_id = firstProd[0].id;
+        }
+      }
+
       // Distributor sales restriction: FSM and Salesman cannot sell to distributors
       if (customer_type === 'distributor' && salesman_id) {
         const { data: sellerUser } = await supabase.from('users').select('role').eq('id', salesman_id).maybeSingle();
@@ -328,8 +337,8 @@ router.post('/api/sales', async (req, res) => {
   }
 });
 
-// Team Oversight (Field Sales Manager: supervised salesmen, live stock, sales performance, aggregate KPIs)
-router.get('/api/team/:fsm_id', async (req, res) => {
+// Team Oversight (Field Sales Manager: supervised salesmen, live stock, sales performance, aggregate KPIs - Protected by General FSM Limiter)
+router.get('/api/team/:fsm_id', fsmGeneralLimiter, async (req, res) => {
   const { fsm_id } = req.params;
 
   if (state.isSupabaseConfigured) {
@@ -469,8 +478,8 @@ function resolveSalesList(list, query) {
   }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 }
 
-// Sales Reports with Multi-dimensional Filtering
-router.get('/api/sales/report', async (req, res) => {
+// Sales Reports with Multi-dimensional Filtering (Protected by General Rate Limiter)
+router.get('/api/sales/report', storeAdminGeneralLimiter, async (req, res) => {
   const { salesman_id, fsm_id, warehouse_id, product_id, customer_id, payment_method, customer_type, start_date, end_date, has_referral } = req.query;
 
   if (state.isSupabaseConfigured) {

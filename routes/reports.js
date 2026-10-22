@@ -3,9 +3,10 @@ const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
 const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
+const { superAdminAnalyticsLimiter } = require('../services/rateLimiter');
 
-// View audit logs
-router.get('/api/audit-logs', async (req, res) => {
+// View audit logs (Protected by Analytics Rate Limiter)
+router.get('/api/audit-logs', superAdminAnalyticsLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data, error } = await supabase.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(100);
@@ -19,8 +20,8 @@ router.get('/api/audit-logs', async (req, res) => {
   }
 });
 
-// Executive Summary for Dashboard
-router.get('/api/reports/summary', async (req, res) => {
+// Executive Summary for Dashboard (Protected by Analytics Rate Limiter)
+router.get('/api/reports/summary', superAdminAnalyticsLimiter, async (req, res) => {
   if (state.isSupabaseConfigured) {
     try {
       const { data: sales } = await supabase.from('sales').select('amount, quantity, created_at');

@@ -5,9 +5,10 @@ const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { unlockAccount } = require('../services/authService');
+const { superAdminGeneralLimiter, superAdminSensitiveLimiter, salesmanDutyLimiter } = require('../services/rateLimiter');
 
-// List all workforce users (Directly from database with Passwords, Phone, and Aadhaar info for Super Admin)
-router.get('/api/users', async (req, res) => {
+// List all workforce users (Protected by General Admin Rate Limiter)
+router.get('/api/users', superAdminGeneralLimiter, async (req, res) => {
   const { role, status, search } = req.query;
 
   const enrichUser = (u) => ({
@@ -57,13 +58,13 @@ router.get('/api/users', async (req, res) => {
   }
 });
 
-// Alias for backwards compatibility
-router.get('/api/workforce', async (req, res) => {
+// Alias for backwards compatibility (Protected by General Admin Rate Limiter)
+router.get('/api/workforce', superAdminGeneralLimiter, async (req, res) => {
   return res.redirect(307, '/api/users');
 });
 
-// Create user directly (Super Admin - saves Password & Aadhaar card in database)
-router.post('/api/users', async (req, res) => {
+// Create user directly (Protected by Sensitive Admin Rate Limiter)
+router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
   const { name, email, phone, role, warehouse_id, parent_id, password, aadhaar_number, aadhaar_doc, admin_id, admin_name } = req.body;
   if (!name || !email || !role) {
     return res.status(400).json({ error: 'Name, email, and role are required' });
@@ -155,8 +156,8 @@ router.post('/api/users', async (req, res) => {
   }
 });
 
-// Super Admin reset or update password for any worker (persisted directly in database)
-router.post('/api/users/:id/reset-password', async (req, res) => {
+// Super Admin reset or update password for any worker (Protected by Sensitive Admin Rate Limiter)
+router.post('/api/users/:id/reset-password', superAdminSensitiveLimiter, async (req, res) => {
   const { id } = req.params;
   const { password, admin_id, admin_name } = req.body;
   if (!password || password.trim().length < 4) {
@@ -187,8 +188,8 @@ router.post('/api/users/:id/reset-password', async (req, res) => {
   return res.json({ success: true, message: `Password for ${user.name} has been updated to "${password.trim()}".` });
 });
 
-// Update user details (Super Admin - persisted in database)
-router.put('/api/users/:id', async (req, res) => {
+// Update user details (Protected by General Admin Rate Limiter)
+router.put('/api/users/:id', superAdminGeneralLimiter, async (req, res) => {
   const { id } = req.params;
   const { name, email, phone, role, warehouse_id, parent_id, status, password, aadhaar_number, aadhaar_doc, admin_id, admin_name } = req.body;
 
@@ -239,8 +240,8 @@ router.put('/api/users/:id', async (req, res) => {
   }
 });
 
-// Delete user account (Super Admin)
-router.delete('/api/users/:id', async (req, res) => {
+// Delete user account (Protected by Sensitive Admin Rate Limiter)
+router.delete('/api/users/:id', superAdminSensitiveLimiter, async (req, res) => {
   const { id } = req.params;
   const { admin_id, admin_name } = req.query;
 
@@ -264,8 +265,8 @@ router.delete('/api/users/:id', async (req, res) => {
   }
 });
 
-// Salesman Duty Status Toggle
-router.put('/api/users/:id/duty', async (req, res) => {
+// Salesman Duty Status Toggle (Protected by Salesman Duty Limiter)
+router.put('/api/users/:id/duty', salesmanDutyLimiter, async (req, res) => {
   const { id } = req.params;
   const { is_on_duty } = req.body;
   const user = mockDb.users.find(u => u.id === id);
