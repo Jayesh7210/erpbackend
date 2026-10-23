@@ -31,6 +31,31 @@ router.get('/api/users', superAdminGeneralLimiter, async (req, res) => {
       const { data, error } = await query;
       if (error) throw error;
       const enriched = (data || []).map(enrichUser);
+
+      // Merge any users in mockDb that are not in Supabase
+      const seenIds = new Set(enriched.map(u => String(u.id)));
+      const seenEmails = new Set(enriched.map(u => String(u.email || '').toLowerCase()));
+
+      for (const mu of (mockDb.users || [])) {
+        const mEmail = String(mu.email || '').toLowerCase();
+        if (!seenIds.has(String(mu.id)) && (!mEmail || !seenEmails.has(mEmail))) {
+          if (role && role !== 'all' && mu.role !== role) continue;
+          if (status && status !== 'all' && mu.status !== status) continue;
+          if (search) {
+            const s = search.toLowerCase();
+            const matches = (mu.name || '').toLowerCase().includes(s) || mEmail.includes(s) || (mu.phone && mu.phone.includes(s));
+            if (!matches) continue;
+          }
+          const wh = (mockDb.warehouses || []).find(w => w.id === mu.warehouse_id);
+          const parent = (mockDb.users || []).find(p => p.id === mu.parent_id);
+          enriched.push(enrichUser({
+            ...mu,
+            warehouse: wh ? { name: wh.name } : null,
+            parent: parent ? { name: parent.name } : null
+          }));
+        }
+      }
+
       return res.json(enriched);
     } catch (err) {
       return res.status(500).json({ error: err.message });

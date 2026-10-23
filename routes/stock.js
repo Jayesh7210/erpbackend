@@ -950,12 +950,13 @@ router.get('/api/stock/global', superAdminAnalyticsLimiter, async (req, res) => 
 
 // Full Stock Transfers History (Super Admin & Store Admin & FSM - Protected by General Admin Rate Limiter)
 router.get('/api/stock/transfers', superAdminGeneralLimiter, async (req, res) => {
-  const { from_id, to_id, status, user_id } = req.query;
+  const { from_id, to_id, status, user_id, id } = req.query;
 
   if (state.isSupabaseConfigured) {
     try {
       let query = supabase.from('stock_transfers')
         .select('*, product:products(name, sku, unit)');
+      if (id) query = query.eq('id', id);
       if (from_id) query = query.eq('from_id', from_id);
       if (to_id) query = query.eq('to_id', to_id);
       if (status && status !== 'all') query = query.eq('status', status);
@@ -971,11 +972,21 @@ router.get('/api/stock/transfers', superAdminGeneralLimiter, async (req, res) =>
         ...(warehouses || []).map(w => [w.id, w.name])
       ]);
 
-      const resolved = data.map(t => ({
-        ...t,
-        from_name: nameMap.get(t.from_id) || 'Unknown Source',
-        to_name: nameMap.get(t.to_id) || 'Unknown Destination'
-      }));
+      const resolved = data.map(t => {
+        let pinHash = 0;
+        const idStr = String(t.id);
+        for (let i = 0; i < idStr.length; i++) {
+          pinHash = ((pinHash << 5) - pinHash) + idStr.charCodeAt(i);
+          pinHash |= 0;
+        }
+        const security_pin = (Math.abs(pinHash) % 900000 + 100000).toString();
+        return {
+          ...t,
+          security_pin,
+          from_name: nameMap.get(t.from_id) || 'Unknown Source',
+          to_name: nameMap.get(t.to_id) || 'Unknown Destination'
+        };
+      });
 
       return res.json(resolved);
     } catch (err) {
@@ -988,6 +999,7 @@ router.get('/api/stock/transfers', superAdminGeneralLimiter, async (req, res) =>
     ]);
 
     let list = [...mockDb.transfers];
+    if (id) list = list.filter(t => t.id === id);
     if (from_id) list = list.filter(t => t.from_id === from_id);
     if (to_id) list = list.filter(t => t.to_id === to_id);
     if (status && status !== 'all') list = list.filter(t => t.status === status);
@@ -995,15 +1007,76 @@ router.get('/api/stock/transfers', superAdminGeneralLimiter, async (req, res) =>
 
     const resolved = list.map(t => {
       const product = mockDb.products.find(p => p.id === t.product_id);
+      let pinHash = 0;
+      const idStr = String(t.id);
+      for (let i = 0; i < idStr.length; i++) {
+        pinHash = ((pinHash << 5) - pinHash) + idStr.charCodeAt(i);
+        pinHash |= 0;
+      }
+      const security_pin = (Math.abs(pinHash) % 900000 + 100000).toString();
       return {
         ...t,
         product,
+        security_pin,
         from_name: nameMap.get(t.from_id) || 'Unknown Source',
         to_name: nameMap.get(t.to_id) || 'Unknown Destination'
       };
     }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
     return res.json(resolved);
+  }
+});
+
+// Single Transfer Lookup by ID
+router.get('/api/stock/transfers/:id', superAdminGeneralLimiter, async (req, res) => {
+  const { id } = req.params;
+  if (state.isSupabaseConfigured) {
+    try {
+      const { data, error } = await supabase.from('stock_transfers')
+        .select('*, product:products(name, sku, unit)')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: 'Transfer not found' });
+
+      let from_name = 'Warehouse';
+      let to_name = 'Staff';
+      const { data: senderUser } = await supabase.from('users').select('name').eq('id', data.from_id).maybeSingle();
+      const { data: senderWh } = await supabase.from('warehouses').select('name').eq('id', data.from_id).maybeSingle();
+      const { data: rcvrUser } = await supabase.from('users').select('name').eq('id', data.to_id).maybeSingle();
+
+      from_name = senderUser?.name || senderWh?.name || 'Warehouse';
+      to_name = rcvrUser?.name || 'Recipient';
+
+      let pinHash = 0;
+      const idStr = String(data.id);
+      for (let i = 0; i < idStr.length; i++) {
+        pinHash = ((pinHash << 5) - pinHash) + idStr.charCodeAt(i);
+        pinHash |= 0;
+      }
+      const security_pin = (Math.abs(pinHash) % 900000 + 100000).toString();
+
+      return res.json({
+        ...data,
+        security_pin,
+        from_name,
+        to_name
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  } else {
+    const t = mockDb.transfers.find(x => x.id === id);
+    if (!t) return res.status(404).json({ error: 'Transfer not found' });
+    const product = mockDb.products.find(p => p.id === t.product_id);
+    let pinHash = 0;
+    const idStr = String(t.id);
+    for (let i = 0; i < idStr.length; i++) {
+      pinHash = ((pinHash << 5) - pinHash) + idStr.charCodeAt(i);
+      pinHash |= 0;
+    }
+    const security_pin = (Math.abs(pinHash) % 900000 + 100000).toString();
+    return res.json({ ...t, product, security_pin, from_name: 'Warehouse', to_name: 'Field Manager' });
   }
 });
 

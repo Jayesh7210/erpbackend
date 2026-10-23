@@ -271,6 +271,8 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
   const generatedEmail = `${full_name.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Math.floor(100+Math.random()*900)}@erp.com`;
   const newReqId = `req_${Date.now()}`;
 
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   // Dynamically resolve referrer's warehouse_id and parent_id
   let resolvedWarehouseId = null;
   let resolvedParentId = null;
@@ -281,16 +283,32 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
     resolvedParentId = referrerUser.parent_id || null;
   }
 
-  if (state.isSupabaseConfigured && (!resolvedWarehouseId || !resolvedParentId)) {
+  if (state.isSupabaseConfigured) {
     try {
-      const { data: dbUser } = await supabase
-        .from('users')
-        .select('warehouse_id, parent_id')
-        .eq('id', referrer_id)
-        .maybeSingle();
-      if (dbUser) {
-        if (!resolvedWarehouseId && dbUser.warehouse_id) resolvedWarehouseId = dbUser.warehouse_id;
-        if (!resolvedParentId && dbUser.parent_id) resolvedParentId = dbUser.parent_id;
+      if (referrer_id && UUID_REGEX.test(referrer_id)) {
+        const { data: dbUser } = await supabase
+          .from('users')
+          .select('warehouse_id, parent_id')
+          .eq('id', referrer_id)
+          .maybeSingle();
+        if (dbUser) {
+          if (dbUser.warehouse_id) resolvedWarehouseId = dbUser.warehouse_id;
+          if (dbUser.parent_id) resolvedParentId = dbUser.parent_id;
+        }
+      }
+
+      // Ensure warehouse_id is a valid UUID
+      if (!resolvedWarehouseId || !UUID_REGEX.test(String(resolvedWarehouseId))) {
+        const { data: firstWh } = await supabase.from('warehouses').select('id').limit(1).maybeSingle();
+        if (firstWh && firstWh.id) resolvedWarehouseId = firstWh.id;
+      }
+
+      // Ensure parent_id is a valid UUID
+      if (resolvedParentId && !UUID_REGEX.test(String(resolvedParentId))) {
+        resolvedParentId = null;
+      }
+      if (!resolvedParentId && referrer_id && UUID_REGEX.test(referrer_id)) {
+        resolvedParentId = referrer_id;
       }
     } catch (_) {}
   }
@@ -311,7 +329,6 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
     kyc_doc: kyc_doc || '',
     created_at: new Date().toISOString()
   };
-  mockDb.userRequests.unshift(newReq);
 
   // 2. Track in salesman's referrals list
   const newReferral = {
@@ -327,24 +344,32 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
     kyc_status: 'Pending Review',
     created_at: new Date().toISOString()
   };
-  if (!mockDb.salesmanReferrals) mockDb.salesmanReferrals = [];
-  mockDb.salesmanReferrals.unshift(newReferral);
 
   if (state.isSupabaseConfigured) {
     try {
-      await supabase.from('user_creation_requests').insert([{
+      const { data: dbReq } = await supabase.from('user_creation_requests').insert([{
         name: full_name,
         email: generatedEmail,
         role: 'salesman',
         warehouse_id: resolvedWarehouseId,
         parent_id: resolvedParentId,
-        requested_by: referrer_id || null,
+        requested_by: referrer_id && UUID_REGEX.test(referrer_id) ? referrer_id : null,
         status: 'pending'
-      }]);
+      }]).select().single();
+      if (dbReq && dbReq.id) {
+        newReq.id = dbReq.id;
+        newReferral.referred_salesman_id = dbReq.id;
+      }
     } catch (e) {
       console.warn('user_creation_requests Supabase sync notice:', e.message);
     }
   }
+
+  if (!mockDb.userRequests) mockDb.userRequests = [];
+  mockDb.userRequests.unshift(newReq);
+
+  if (!mockDb.salesmanReferrals) mockDb.salesmanReferrals = [];
+  mockDb.salesmanReferrals.unshift(newReferral);
 
   await logAudit(referrer_id || 'system', 'Salesman', 'SUBMIT_REFERRAL', 'user_creation_requests', newReqId, `Submitted referral request for ${full_name} (${phone}) awaiting Super Admin approval`);
   return res.status(201).json(newReferral);

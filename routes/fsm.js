@@ -281,23 +281,44 @@ router.get('/api/fsm/referral-requests/:fsm_id', fsmGeneralLimiter, async (req, 
 router.put('/api/fsm/referral-requests/:id', fsmOperationsLimiter, async (req, res) => {
   const { id } = req.params;
   const { status, fsm_id } = req.body;
+  const newStatus = status || 'approved';
 
   if (state.isSupabaseConfigured) {
     try {
-      await supabase
+      const { data: reqData } = await supabase
         .from('user_creation_requests')
-        .update({ status: status || 'approved' })
-        .eq('id', id);
+        .update({ status: newStatus })
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+
+      if (newStatus === 'approved' && reqData) {
+        // Automatically provision user account in users table if approving
+        const { data: existingUser } = await supabase.from('users').select('id').eq('email', reqData.email).maybeSingle();
+        if (!existingUser) {
+          await supabase.from('users').insert([{
+            name: reqData.name,
+            email: reqData.email,
+            role: 'salesman',
+            warehouse_id: reqData.warehouse_id,
+            parent_id: fsm_id || reqData.parent_id,
+            status: 'approved',
+            requires_password_setup: true,
+            phone: reqData.phone || '',
+            password: 'sales123'
+          }]);
+        }
+      }
     } catch (_) {}
   }
 
   const item = (mockDb.referralRequests || []).find(r => r.id === id);
   if (item) {
-    item.status = status || 'approved';
+    item.status = newStatus;
   }
 
-  await logAudit(fsm_id || 'system', 'Field Manager', 'UPDATE_REFERRAL_REQUEST', 'referral_requests', id, `Referral request marked as ${status || 'approved'}`);
-  return res.json(item || { id, status: status || 'approved' });
+  await logAudit(fsm_id || 'system', 'Field Manager', 'UPDATE_REFERRAL_REQUEST', 'referral_requests', id, `Referral request marked as ${newStatus}`);
+  return res.json(item || { id, status: newStatus });
 });
 
 // 6. Settlement Hub Summary (Protected by General FSM Limiter)
