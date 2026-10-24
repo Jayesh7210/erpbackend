@@ -1,8 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
-const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const {
   getDefaultPasswordForRole,
@@ -30,25 +28,15 @@ router.post('/api/auth/check-status', authGeneralLimiter, async (req, res) => {
   // 2. If not found in approved users, check if pending in requests queue
   if (!matchedUser) {
     let pendingReq = null;
-    if (state.isSupabaseConfigured) {
-      try {
-        const { data } = await supabase.from('user_creation_requests').select('*').eq('status', 'pending');
-        if (data) {
-          pendingReq = data.find(r => 
-            (isEmail && r.email?.toLowerCase() === loginId.toLowerCase()) ||
-            (!isEmail && digits.length >= 10 && (r.phone || '').replace(/[^0-9]/g, '').endsWith(digits))
-          );
-        }
-      } catch (_) {}
-    }
-    if (!pendingReq) {
-      pendingReq = (mockDb.userRequests || []).find(r => 
-        r.status === 'pending' && (
+    try {
+      const { data } = await supabase.from('user_creation_requests').select('*').eq('status', 'pending');
+      if (data) {
+        pendingReq = data.find(r => 
           (isEmail && r.email?.toLowerCase() === loginId.toLowerCase()) ||
           (!isEmail && digits.length >= 10 && (r.phone || '').replace(/[^0-9]/g, '').endsWith(digits))
-        )
-      );
-    }
+        );
+      }
+    } catch (_) {}
 
     if (pendingReq) {
       return res.json({
@@ -96,22 +84,13 @@ router.post('/api/auth/setup-password', authGeneralLimiter, async (req, res) => 
   }
 
   // Update password directly in database
-  if (state.isSupabaseConfigured) {
-    try {
-      await supabase.from('users').update({
-        password: newPass,
-        requires_password_setup: false
-      }).eq('id', matchedUser.id);
-    } catch (err) {
-      console.warn('Supabase setup-password update error:', err.message);
-    }
-  }
-
-  // Update in-memory fallback
-  const memUser = mockDb.users.find(u => u.id === matchedUser.id || u.email.toLowerCase() === matchedUser.email.toLowerCase());
-  if (memUser) {
-    memUser.password = newPass;
-    memUser.requires_password_setup = false;
+  try {
+    await supabase.from('users').update({
+      password: newPass,
+      requires_password_setup: false
+    }).eq('id', matchedUser.id);
+  } catch (err) {
+    console.warn('Supabase setup-password update error:', err.message);
   }
 
   await logAudit(
@@ -159,25 +138,16 @@ router.post('/api/auth/login', checkLoginRateLimit, async (req, res) => {
 
     // Check if account is still waiting for approval
     let pendingReq = null;
-    if (state.isSupabaseConfigured) {
-      try {
-        const { data } = await supabase.from('user_creation_requests').select('*').eq('status', 'pending');
-        if (data) {
-          pendingReq = data.find(r => 
-            (isEmail && r.email?.toLowerCase() === loginId.toLowerCase()) ||
-            (!isEmail && digits.length >= 10 && (r.phone || '').replace(/[^0-9]/g, '').endsWith(digits))
-          );
-        }
-      } catch (_) {}
-    }
-    if (!pendingReq) {
-      pendingReq = (mockDb.userRequests || []).find(r => 
-        r.status === 'pending' && (
+    try {
+      const { data } = await supabase.from('user_creation_requests').select('*').eq('status', 'pending');
+      if (data) {
+        pendingReq = data.find(r => 
           (isEmail && r.email?.toLowerCase() === loginId.toLowerCase()) ||
           (!isEmail && digits.length >= 10 && (r.phone || '').replace(/[^0-9]/g, '').endsWith(digits))
-        )
-      );
-    }
+        );
+      }
+    } catch (_) {}
+
     if (pendingReq) {
       return res.status(403).json({
         error: 'Your account registration is still pending Super Admin approval. Please contact Super Admin.'

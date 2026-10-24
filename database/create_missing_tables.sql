@@ -12,6 +12,20 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================================
+-- 1B. Custom Enums
+DO $$ BEGIN
+    ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'distributor';
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'customer';
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+-- ============================================================================
 -- 2. ALTER EXISTING TABLES WITH MISSING COLUMNS
 -- ============================================================================
 
@@ -42,6 +56,9 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS fsm_commission DECIMAL(12, 2) DEFA
 ALTER TABLE products ADD COLUMN IF NOT EXISTS salesman_commission DECIMAL(12, 2) DEFAULT 0.00;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS referral_commission DECIMAL(12, 2) DEFAULT 0.00;
 
+-- B2. Product Prices Table: Add discount_percentage
+ALTER TABLE product_prices ADD COLUMN IF NOT EXISTS discount_percentage NUMERIC DEFAULT 0;
+
 -- C. Sales Table: Add warehouse, customer link, customer type, referral code
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS warehouse_id UUID REFERENCES warehouses(id) ON DELETE SET NULL;
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_id UUID;
@@ -56,12 +73,16 @@ ALTER TABLE user_creation_requests ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
 ALTER TABLE user_creation_requests ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
 ALTER TABLE user_creation_requests ADD COLUMN IF NOT EXISTS referrer_id UUID REFERENCES users(id) ON DELETE SET NULL;
 
--- F. Stock Inward Requests: Add truck, driver details, batch, and challan doc
+-- F. Stock Inward Requests: Add truck, driver details, batch, notes, and challan doc
 ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS truck_number VARCHAR(100);
 ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS driver_name VARCHAR(100);
 ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS driver_phone VARCHAR(50);
 ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS batch_number VARCHAR(100);
 ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS challan_doc_url TEXT;
+ALTER TABLE stock_inward_requests ADD COLUMN IF NOT EXISTS notes TEXT;
+
+-- G. Stock Transfers: Add batch_number
+ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS batch_number VARCHAR(100);
 
 -- ============================================================================
 -- 3. CREATE MISSING TABLES
@@ -169,6 +190,7 @@ CREATE TABLE IF NOT EXISTS settlements (
     security_pin VARCHAR(20),
     return_qr_verified BOOLEAN DEFAULT FALSE,
     settled_at TIMESTAMP WITH TIME ZONE,
+    notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -221,3 +243,10 @@ ON CONFLICT (role, permission_key) DO NOTHING;
 INSERT INTO users (id, name, email, phone, role, status)
 VALUES ('00000000-0000-0000-0000-000000000001', 'Super Admin', 'admin@erp.com', '', 'super_admin', 'approved')
 ON CONFLICT (email) DO NOTHING;
+
+-- ============================================================================
+-- 6. GRANT PERMISSIONS (Postgres & Supabase Roles)
+-- ============================================================================
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL ROUTINES IN SCHEMA public TO postgres, anon, authenticated, service_role;

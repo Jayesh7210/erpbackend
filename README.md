@@ -11,7 +11,6 @@ Modular Express.js backend for Sanap ERP with Supabase integration and offline f
 ```
 backend/
 ├── data/
-│   ├── mockDb.js             # In-memory store for standalone/offline fallback
 │   └── state.js              # Connection state & health-check
 ├── database/
 │   ├── schema.sql            # Core database schema

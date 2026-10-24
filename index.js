@@ -43,6 +43,10 @@ app.get('/', (req, res) => {
   });
 });
 
+const path = require('path');
+const webBuildPath = path.join(__dirname, '../frontend/build/web');
+app.use('/app', express.static(webBuildPath));
+
 // Mount modular route handlers
 app.use(authRoutes);
 app.use(workforceRoutes);

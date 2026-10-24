@@ -1,11 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
-const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getDefaultProductUnitPrice } = require('../services/productMeta');
 const { optimizeBase64Image } = require('../services/imageOptimizer');
+const { runtimeSettlements, fsmSettlementHub } = require('../services/settlementService');
 const { fsmGeneralLimiter, fsmOperationsLimiter, salesmanGeneralLimiter } = require('../services/rateLimiter');
 
 // Daily Settlements (List, Create, Approve for Salesman & FSM - Protected by General FSM Limiter)
@@ -13,23 +12,21 @@ router.get('/api/settlements', fsmGeneralLimiter, async (req, res) => {
   const { salesman_id, fsm_id, status } = req.query;
 
   let list = [];
-  if (state.isSupabaseConfigured) {
-    try {
-      let query = supabase.from('settlements').select('*');
-      if (salesman_id) query = query.eq('salesman_id', salesman_id);
-      if (fsm_id) query = query.eq('fsm_id', fsm_id);
-      if (status && status !== 'all') query = query.eq('status', status);
-      const { data, error } = await query.order('created_at', { ascending: false });
-      if (!error && data && data.length > 0) {
-        list = data;
-      }
-    } catch (e) {
-      console.warn('Supabase settlements query notice:', e.message);
+  try {
+    let query = supabase.from('settlements').select('*');
+    if (salesman_id) query = query.eq('salesman_id', salesman_id);
+    if (fsm_id) query = query.eq('fsm_id', fsm_id);
+    if (status && status !== 'all') query = query.eq('status', status);
+    const { data, error } = await query.order('created_at', { ascending: false });
+    if (!error && data && data.length > 0) {
+      list = data;
     }
+  } catch (e) {
+    console.warn('Supabase settlements query notice:', e.message);
   }
 
   if (list.length === 0) {
-    list = [...(mockDb.settlements || [])];
+    list = [...runtimeSettlements];
     if (salesman_id) {
       list = list.filter(s => s.salesman_id === salesman_id);
     }
@@ -40,16 +37,21 @@ router.get('/api/settlements', fsmGeneralLimiter, async (req, res) => {
       list = list.filter(s => s.status === status);
     }
   }
-  if (fsm_id) {
-    list = list.filter(s => s.fsm_id === fsm_id);
-  }
-  if (status && status !== 'all') {
-    list = list.filter(s => s.status === status);
+
+  const userIds = [...new Set([...list.map(s => s.salesman_id), ...list.map(s => s.fsm_id)].filter(Boolean))];
+  const userMap = new Map();
+  if (userIds.length > 0) {
+    try {
+      const { data: users } = await supabase.from('users').select('id, name, role').in('id', userIds);
+      if (users) {
+        users.forEach(u => userMap.set(u.id, u));
+      }
+    } catch (_) {}
   }
 
   const enriched = list.map(s => {
-    const salesman = (mockDb.users || []).find(u => u.id === s.salesman_id) || { name: s.salesman_name || 'Salesman' };
-    const fsm = (mockDb.users || []).find(u => u.id === s.fsm_id) || { name: s.fsm_name || 'Field Manager' };
+    const salesman = userMap.get(s.salesman_id) || { name: s.salesman_name || 'Salesman' };
+    const fsm = userMap.get(s.fsm_id) || { name: s.fsm_name || 'Field Manager' };
     return { ...s, salesman, fsm };
   });
 
@@ -59,15 +61,14 @@ router.get('/api/settlements', fsmGeneralLimiter, async (req, res) => {
 // Single settlement by ID (Polling protected by Salesman General Limiter)
 router.get('/api/settlement/:id', salesmanGeneralLimiter, async (req, res) => {
   const { id } = req.params;
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
-      if (!error && data) {
-        return res.json(data);
-      }
-    } catch (_) {}
-  }
-  const item = (mockDb.settlements || []).find(s => s.id === id);
+  try {
+    const { data, error } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
+    if (!error && data) {
+      return res.json(data);
+    }
+  } catch (_) {}
+
+  const item = runtimeSettlements.find(s => s.id === id);
   if (!item) return res.status(404).json({ error: 'Settlement not found' });
   return res.json(item);
 });
@@ -76,13 +77,11 @@ const approveSettlementHandler = async (req, res) => {
   const { id } = req.params;
   const { approved_by, fsm_id } = req.body || {};
 
-  let item = (mockDb.settlements || []).find(s => s.id === id);
-  if (!item && state.isSupabaseConfigured) {
-    try {
-      const { data } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
-      if (data) item = data;
-    } catch (_) {}
-  }
+  let item = runtimeSettlements.find(s => s.id === id);
+  try {
+    const { data } = await supabase.from('settlements').select('*').eq('id', id).maybeSingle();
+    if (data) item = data;
+  } catch (_) {}
 
   if (!item) {
     return res.status(404).json({ error: 'Settlement not found' });
@@ -98,75 +97,65 @@ const approveSettlementHandler = async (req, res) => {
   const totalSettledBottles = soldQty + returnedQty + damagedQty;
 
   // Credit returned bottles back to FSM depot stock
-  if (mockDb.fsmSettlementHub) {
-    mockDb.fsmSettlementHub.depot_stock = (mockDb.fsmSettlementHub.depot_stock || 0) + returnedQty;
-    mockDb.fsmSettlementHub.warehouse = mockDb.fsmSettlementHub.warehouse || {};
-    mockDb.fsmSettlementHub.warehouse.sold = (mockDb.fsmSettlementHub.warehouse.sold || 0) + soldQty;
-    mockDb.fsmSettlementHub.warehouse.returned = (mockDb.fsmSettlementHub.warehouse.returned || 0) + returnedQty;
-    mockDb.fsmSettlementHub.warehouse.sold_value = (mockDb.fsmSettlementHub.warehouse.sold_value || 0) + Number(item.sold_amount || 0);
+  fsmSettlementHub.depot_stock = (fsmSettlementHub.depot_stock || 0) + returnedQty;
+  fsmSettlementHub.warehouse = fsmSettlementHub.warehouse || {};
+  fsmSettlementHub.warehouse.sold = (fsmSettlementHub.warehouse.sold || 0) + soldQty;
+  fsmSettlementHub.warehouse.returned = (fsmSettlementHub.warehouse.returned || 0) + returnedQty;
+  fsmSettlementHub.warehouse.sold_value = (fsmSettlementHub.warehouse.sold_value || 0) + Number(item.sold_amount || 0);
 
-    // Update in team_settlement
-    mockDb.fsmSettlementHub.team_settlement = mockDb.fsmSettlementHub.team_settlement || [];
-    const existingIdx = mockDb.fsmSettlementHub.team_settlement.findIndex(ts => ts.settlement_id === id || ts.salesman_id === item.salesman_id);
-    const teamEntry = {
-      settlement_id: id,
-      salesman_id: item.salesman_id,
-      name: item.salesman_name || 'Salesman',
-      sold: soldQty,
-      unsold: returnedQty,
-      remaining: returnedQty,
-      damaged: damagedQty,
-      damage_notes: item.damage_notes || '',
-      damage_image_url: item.damage_image_url || '',
-      cash_collected: item.cash_received || item.cash_collected || 0,
-      online_payment: item.online_payment || 0,
-      difference: 0,
+  // Update in team_settlement
+  fsmSettlementHub.team_settlement = fsmSettlementHub.team_settlement || [];
+  const existingIdx = fsmSettlementHub.team_settlement.findIndex(ts => ts.settlement_id === id || ts.salesman_id === item.salesman_id);
+  const teamEntry = {
+    settlement_id: id,
+    salesman_id: item.salesman_id,
+    name: item.salesman_name || 'Salesman',
+    sold: soldQty,
+    unsold: returnedQty,
+    remaining: returnedQty,
+    damaged: damagedQty,
+    damage_notes: item.damage_notes || '',
+    damage_image_url: item.damage_image_url || '',
+    cash_collected: item.cash_received || item.cash_collected || 0,
+    online_payment: item.online_payment || 0,
+    difference: 0,
+    status: 'settled',
+    date: 'Today',
+    settled_at: item.settled_at
+  };
+  if (existingIdx >= 0) {
+    fsmSettlementHub.team_settlement[existingIdx] = teamEntry;
+  } else {
+    fsmSettlementHub.team_settlement.unshift(teamEntry);
+  }
+
+  // Update Supabase DB tables
+  try {
+    // 1. Update settlement record status in database
+    await supabase.from('settlements').update({
       status: 'settled',
-      date: 'Today',
-      settled_at: item.settled_at
-    };
-    if (existingIdx >= 0) {
-      mockDb.fsmSettlementHub.team_settlement[existingIdx] = teamEntry;
-    } else {
-      mockDb.fsmSettlementHub.team_settlement.unshift(teamEntry);
-    }
-  }
+      difference: 0
+    }).eq('id', id);
 
-  // Deduct settled stock from Salesman's held inventory
-  const smUser = (mockDb.users || []).find(u => u.id === item.salesman_id);
-  if (smUser) {
-    smUser.current_stock = Math.max(0, (smUser.current_stock || 0) - totalSettledBottles);
-  }
-
-  // If Supabase is connected, update DB tables
-  if (state.isSupabaseConfigured) {
-    try {
-      // 1. Update settlement record status in database
-      await supabase.from('settlements').update({
-        status: 'settled',
-        difference: 0
-      }).eq('id', id);
-
-      // 2. Deduct from salesman stock (owner_id in stocks table)
-      if (item.salesman_id) {
-        const { data: smStock } = await supabase.from('stocks').select('*').eq('owner_id', item.salesman_id).maybeSingle();
-        if (smStock) {
-          const updatedQty = Math.max(0, (smStock.quantity || 0) - totalSettledBottles);
-          await supabase.from('stocks').update({ quantity: updatedQty }).eq('id', smStock.id);
-        }
+    // 2. Deduct from salesman stock (owner_id in stocks table)
+    if (item.salesman_id) {
+      const { data: smStock } = await supabase.from('stocks').select('*').eq('owner_id', item.salesman_id).maybeSingle();
+      if (smStock) {
+        const updatedQty = Math.max(0, (smStock.quantity || 0) - totalSettledBottles);
+        await supabase.from('stocks').update({ quantity: updatedQty }).eq('id', smStock.id);
       }
-
-      // 3. Credit returned stock back to FSM depot
-      const targetFsmId = item.fsm_id || fsm_id;
-      if (targetFsmId) {
-        const { data: fsmStock } = await supabase.from('stocks').select('*').eq('owner_id', targetFsmId).maybeSingle();
-        if (fsmStock) {
-          await supabase.from('stocks').update({ quantity: (fsmStock.quantity || 0) + returnedQty }).eq('id', fsmStock.id);
-        }
-      }
-    } catch (e) {
-      console.warn('Supabase settlement stock sync notice:', e.message);
     }
+
+    // 3. Credit returned stock back to FSM depot
+    const targetFsmId = item.fsm_id || fsm_id;
+    if (targetFsmId) {
+      const { data: fsmStock } = await supabase.from('stocks').select('*').eq('owner_id', targetFsmId).maybeSingle();
+      if (fsmStock) {
+        await supabase.from('stocks').update({ quantity: (fsmStock.quantity || 0) + returnedQty }).eq('id', fsmStock.id);
+      }
+    }
+  } catch (e) {
+    console.warn('Supabase settlement stock sync notice:', e.message);
   }
 
   await logAudit(
@@ -187,9 +176,28 @@ router.put('/api/settlements/:id/accept', fsmOperationsLimiter, approveSettlemen
 // Salesman settlement details (Protected by Salesman General Limiter)
 router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
-  const list = (mockDb.settlements || []).filter(s => s.salesman_id === salesman_id);
-  const user = mockDb.users.find(u => u.id === salesman_id);
-  const currentStock = user ? (Number(user.current_stock) || 0) : 0;
+
+  let list = [];
+  try {
+    const { data } = await supabase.from('settlements').select('*').eq('salesman_id', salesman_id).order('created_at', { ascending: false });
+    if (data && data.length > 0) list = data;
+  } catch (_) {}
+
+  if (list.length === 0) {
+    list = runtimeSettlements.filter(s => s.salesman_id === salesman_id);
+  }
+
+  let currentStock = 0;
+  try {
+    const { data: smStock } = await supabase.from('stocks').select('quantity').eq('owner_id', salesman_id).maybeSingle();
+    if (smStock) {
+      currentStock = Number(smStock.quantity) || 0;
+    } else {
+      const { data: user } = await supabase.from('users').select('current_stock').eq('id', salesman_id).maybeSingle();
+      if (user) currentStock = Number(user.current_stock) || 0;
+    }
+  } catch (_) {}
+
   const dynamicUnitPrice = await getDefaultProductUnitPrice();
   const todayDispatch = {
     date_label: 'Today',
@@ -200,6 +208,7 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
     status: 'pending',
     verified: currentStock > 0
   };
+
   return res.json({
     today: todayDispatch,
     history: list
@@ -244,7 +253,7 @@ router.post('/api/settlements', fsmOperationsLimiter, async (req, res) => {
   const difference = Math.max(0, soldAmount - totalPaid);
 
   let finalDamageUrl = damage_image_url || '';
-  if (damage_image_base64 && state.isSupabaseConfigured) {
+  if (damage_image_base64) {
     try {
       const optimized = await optimizeBase64Image(damage_image_base64, 'damage_proof.jpg');
       if (optimized) {
@@ -292,66 +301,61 @@ router.post('/api/settlements', fsmOperationsLimiter, async (req, res) => {
     created_at: new Date().toISOString()
   };
 
-  if (!mockDb.settlements) mockDb.settlements = [];
-  mockDb.settlements.unshift(settlement);
+  runtimeSettlements.unshift(settlement);
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data: insertedDbRow, error: insertErr } = await supabase.from('settlements').insert([{
-        salesman_id: salesman_id && salesman_id.length > 20 ? salesman_id : null,
-        salesman_name: settlement.salesman_name,
-        fsm_id: fsm_id && fsm_id.length > 20 ? fsm_id : null,
-        fsm_name: settlement.fsm_name,
-        date_label: 'Today',
-        bottles_dispatched: dispatched,
-        bottles_sold: sold,
-        unsold_bottles: remaining,
-        remaining_qty: remaining,
-        damaged_qty: damaged,
-        damage_notes: damage_notes || '',
-        damage_image_url: finalDamageUrl,
-        unit_price: price,
-        total_value: totalValue,
-        sold_amount: soldAmount,
-        unsold_value: unsoldValue,
-        cash_collected: cash,
-        cash_received: cash,
-        online_payment: online,
-        total_paid: totalPaid,
-        difference,
-        status: status || 'pending_fsm',
-        security_pin: pin
-      }]).select().maybeSingle();
+  try {
+    const { data: insertedDbRow, error: insertErr } = await supabase.from('settlements').insert([{
+      salesman_id: salesman_id && salesman_id.length > 20 ? salesman_id : null,
+      salesman_name: settlement.salesman_name,
+      fsm_id: fsm_id && fsm_id.length > 20 ? fsm_id : null,
+      fsm_name: settlement.fsm_name,
+      date_label: 'Today',
+      bottles_dispatched: dispatched,
+      bottles_sold: sold,
+      unsold_bottles: remaining,
+      remaining_qty: remaining,
+      damaged_qty: damaged,
+      damage_notes: damage_notes || '',
+      damage_image_url: finalDamageUrl,
+      unit_price: price,
+      total_value: totalValue,
+      sold_amount: soldAmount,
+      unsold_value: unsoldValue,
+      cash_collected: cash,
+      cash_received: cash,
+      online_payment: online,
+      total_paid: totalPaid,
+      difference,
+      status: status || 'pending_fsm',
+      security_pin: pin
+    }]).select().maybeSingle();
 
-      if (!insertErr && insertedDbRow && insertedDbRow.id) {
-        settlement.id = insertedDbRow.id;
-      }
-    } catch (e) {
-      console.warn('settlements Supabase insert notice:', e.message);
+    if (!insertErr && insertedDbRow && insertedDbRow.id) {
+      settlement.id = insertedDbRow.id;
     }
+  } catch (e) {
+    console.warn('settlements Supabase insert notice:', e.message);
   }
 
   // Also add to FSM settlement hub pending team settlements
-  if (mockDb.fsmSettlementHub) {
-    mockDb.fsmSettlementHub.team_settlement = mockDb.fsmSettlementHub.team_settlement || [];
-    mockDb.fsmSettlementHub.team_settlement.unshift({
-      settlement_id: settlement.id,
-      salesman_id: settlement.salesman_id,
-      name: settlement.salesman_name,
-      sold: sold,
-      unsold: remaining,
-      remaining: remaining,
-      damaged: damaged,
-      damage_notes: settlement.damage_notes,
-      damage_image_url: settlement.damage_image_url,
-      cash_collected: cash,
-      online_payment: online,
-      difference,
-      status: settlement.status,
-      date: 'Today',
-      created_at: settlement.created_at
-    });
-  }
+  fsmSettlementHub.team_settlement = fsmSettlementHub.team_settlement || [];
+  fsmSettlementHub.team_settlement.unshift({
+    settlement_id: settlement.id,
+    salesman_id: settlement.salesman_id,
+    name: settlement.salesman_name,
+    sold: sold,
+    unsold: remaining,
+    remaining: remaining,
+    damaged: damaged,
+    damage_notes: settlement.damage_notes,
+    damage_image_url: settlement.damage_image_url,
+    cash_collected: cash,
+    online_payment: online,
+    difference,
+    status: settlement.status,
+    date: 'Today',
+    created_at: settlement.created_at
+  });
 
   await logAudit(
     salesman_id || 'salesman',

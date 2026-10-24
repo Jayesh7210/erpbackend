@@ -1,5 +1,4 @@
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 
 function getDefaultPasswordForRole(role) {
@@ -37,15 +36,6 @@ async function findUserByIdentifier(loginId) {
     }
   }
 
-  // Fallback to in-memory mockDb
-  if (isEmail) {
-    return mockDb.users.find(u => u.email.toLowerCase() === loginId.toLowerCase() && u.status === 'approved') || null;
-  } else if (digits.length >= 10) {
-    return mockDb.users.find(u => {
-      const pDigits = (u.phone || '').replace(/[^0-9]/g, '');
-      return pDigits.length >= 10 && (pDigits.endsWith(digits) || digits.endsWith(pDigits)) && u.status === 'approved';
-    }) || null;
-  }
   return null;
 }
 

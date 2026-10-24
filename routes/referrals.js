@@ -1,10 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
-const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { getProductWithMeta } = require('../services/productMeta');
+const { runtimeCommissions, findCommission } = require('../services/commissionService');
 const {
   superAdminGeneralLimiter,
   superAdminSensitiveLimiter,
@@ -14,11 +13,20 @@ const {
   salesmanOnboardingLimiter
 } = require('../services/rateLimiter');
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // Helper to build workforce referral tree
-function buildWorkforceTree() {
-  const users = [...(mockDb.users || [])];
-  const sales = [...(mockDb.sales || [])];
-  const commissions = [...(mockDb.workforceCommissions || [])];
+async function buildWorkforceTree() {
+  let users = [];
+  let sales = [];
+  try {
+    const { data: uData } = await supabase.from('users').select('*');
+    if (uData) users = uData;
+    const { data: sData } = await supabase.from('sales').select('salesman_id, quantity');
+    if (sData) sales = sData;
+  } catch (_) {}
+
+  const commissions = runtimeCommissions;
 
   // Calculate sold bottles today per user
   const salesByUser = {};
@@ -75,20 +83,26 @@ function buildWorkforceTree() {
 }
 
 // Get full workforce referral tree (Protected by Analytics Rate Limiter)
-router.get('/api/referrals/tree', superAdminAnalyticsLimiter, (req, res) => {
-  return res.json(buildWorkforceTree());
+router.get('/api/referrals/tree', superAdminAnalyticsLimiter, async (req, res) => {
+  const tree = await buildWorkforceTree();
+  return res.json(tree);
 });
 
 // Get all workforce referral commissions (Ledger - Protected by General Admin Rate Limiter)
 router.get('/api/referrals', superAdminGeneralLimiter, async (req, res) => {
-  const commissions = mockDb.workforceCommissions || [];
-  const enriched = commissions.map(c => {
-    return {
-      ...c,
-      referrer_name: c.referrer_name || ((mockDb.users || []).find(u => u.id === c.referrer_id)?.name) || 'Referrer',
-      referred_name: c.seller_name || ((mockDb.users || []).find(u => u.id === c.seller_id)?.name) || 'Salesman'
-    };
-  });
+  let commissions = [...runtimeCommissions];
+  try {
+    const { data: dbComms } = await supabase.from('workforce_commissions').select('*');
+    if (dbComms && dbComms.length > 0) {
+      commissions = dbComms;
+    }
+  } catch (_) {}
+
+  const enriched = commissions.map(c => ({
+    ...c,
+    referrer_name: c.referrer_name || 'Referrer',
+    referred_name: c.seller_name || 'Salesman'
+  }));
   return res.json(enriched);
 });
 
@@ -97,15 +111,14 @@ router.post('/api/referrals/:id/payout', superAdminSensitiveLimiter, async (req,
   const { id } = req.params;
   const { admin_id, admin_name } = req.body;
 
-  const comm = (mockDb.workforceCommissions || []).find(c => c.id === id);
+  const comm = findCommission(c => c.id === id);
   if (!comm) {
-    // Check fallback referrals
-    const legacy = (mockDb.referrals || []).find(r => r.id === id);
-    if (legacy) {
-      legacy.status = 'paid';
-      legacy.paid_at = new Date();
-      return res.json({ message: 'Payout marked as paid', referral: legacy });
-    }
+    try {
+      const { data, error } = await supabase.from('workforce_commissions').update({ status: 'paid' }).eq('id', id).select().single();
+      if (!error && data) {
+        return res.json({ message: 'Payout marked as paid', referral: data });
+      }
+    } catch (_) {}
     return res.status(404).json({ error: 'Referral commission record not found' });
   }
 
@@ -127,43 +140,38 @@ router.post('/api/referrals/:id/payout', superAdminSensitiveLimiter, async (req,
 // Salesman Today's Earnings Breakdown (Protected by Salesman General Limiter)
 router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
-  let user = (mockDb.users || []).find(u => u.id === salesman_id);
-  let todaySales = (mockDb.sales || []).filter(s => s.salesman_id === salesman_id);
-  let myReferralComms = (mockDb.workforceCommissions || []).filter(c => c.referrer_id === salesman_id && c.type === 'referral_bonus');
+  let user = null;
+  let todaySales = [];
+  let myReferralComms = runtimeCommissions.filter(c => c.referrer_id === salesman_id && c.type === 'referral_bonus');
 
-  if (state.isSupabaseConfigured) {
-    try {
-      // 1. Fetch user duty & details
-      const { data: dbUser } = await supabase
-        .from('users')
-        .select('id, name, email, is_on_duty, role, parent_id, warehouse_id')
-        .eq('id', salesman_id)
-        .maybeSingle();
-      if (dbUser) {
-        user = { ...user, ...dbUser };
-      }
+  try {
+    // 1. Fetch user duty & details
+    const { data: dbUser } = await supabase
+      .from('users')
+      .select('id, name, email, is_on_duty, role, parent_id, warehouse_id, min_sales_quota, is_quota_condition_active')
+      .eq('id', salesman_id)
+      .maybeSingle();
+    if (dbUser) user = dbUser;
 
-      // 2. Fetch sales from Supabase
-      const { data: dbSales } = await supabase
-        .from('sales')
-        .select('*')
-        .eq('salesman_id', salesman_id);
-      if (dbSales && dbSales.length > 0) {
-        todaySales = dbSales;
-      }
-
-      // 3. Fetch workforce commissions for referrals
-      const { data: dbComms } = await supabase
-        .from('workforce_commissions')
-        .select('*')
-        .eq('referrer_id', salesman_id)
-        .eq('type', 'referral_bonus');
-      if (dbComms && dbComms.length > 0) {
-        myReferralComms = dbComms;
-      }
-    } catch (e) {
-      console.warn('salesman earnings Supabase query warning:', e.message);
+    // 2. Fetch sales from Supabase
+    const { data: dbSales } = await supabase
+      .from('sales')
+      .select('*')
+      .eq('salesman_id', salesman_id);
+    if (dbSales && dbSales.length > 0) {
+      todaySales = dbSales;
     }
+
+    // 3. Fetch workforce commissions for referrals if table exists
+    const { data: dbComms } = await supabase
+      .from('workforce_commissions')
+      .select('*')
+      .eq('referrer_id', salesman_id);
+    if (dbComms && dbComms.length > 0) {
+      myReferralComms = dbComms;
+    }
+  } catch (e) {
+    console.warn('salesman earnings Supabase query warning:', e.message);
   }
 
   const soldBottlesToday = todaySales.reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
@@ -204,44 +212,35 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
 // Salesman Referrals (Get & Submit - Protected by Salesman Limiters)
 router.get('/api/salesman/referrals/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
-  let list = (mockDb.salesmanReferrals || []).filter(r => r.referrer_id === salesman_id);
+  let list = [];
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data: dbRequests } = await supabase
-        .from('user_creation_requests')
-        .select('*')
-        .eq('requested_by', salesman_id);
+  try {
+    const { data: dbRequests } = await supabase
+      .from('user_creation_requests')
+      .select('*')
+      .eq('requested_by', salesman_id);
 
-      if (dbRequests && dbRequests.length > 0) {
-        const dbMapped = dbRequests.map(r => ({
-          id: r.id,
-          referrer_id: salesman_id,
-          referred_salesman_id: r.id,
-          full_name: r.name,
-          phone: r.phone || '',
-          status: r.status === 'approved' ? 'Active' : (r.status === 'rejected' ? 'Rejected' : 'Pending Approval'),
-          earned: 0,
-          bottles_sold: 0,
-          kyc_doc: r.kyc_doc || '',
-          kyc_status: r.status === 'approved' ? 'Verified' : 'Pending Review',
-          created_at: r.created_at
-        }));
-
-        const existingIds = new Set(list.map(x => x.id || x.referred_salesman_id));
-        for (const item of dbMapped) {
-          if (!existingIds.has(item.id) && !existingIds.has(item.referred_salesman_id)) {
-            list.push(item);
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('salesman referrals Supabase fetch warning:', e.message);
+    if (dbRequests && dbRequests.length > 0) {
+      list = dbRequests.map(r => ({
+        id: r.id,
+        referrer_id: salesman_id,
+        referred_salesman_id: r.id,
+        full_name: r.name,
+        phone: r.phone || '',
+        status: r.status === 'approved' ? 'Active' : (r.status === 'rejected' ? 'Rejected' : 'Pending Approval'),
+        earned: 0,
+        bottles_sold: 0,
+        kyc_doc: r.kyc_doc || '',
+        kyc_status: r.status === 'approved' ? 'Verified' : 'Pending Review',
+        created_at: r.created_at
+      }));
     }
+  } catch (e) {
+    console.warn('salesman referrals Supabase fetch warning:', e.message);
   }
 
   const enriched = list.map(ref => {
-    const comms = (mockDb.workforceCommissions || []).filter(
+    const comms = runtimeCommissions.filter(
       c => c.referrer_id === salesman_id && (c.seller_id === ref.referred_salesman_id || c.seller_name === ref.full_name)
     );
     const bottlesSold = comms.reduce((sum, c) => sum + (Number(c.bottles_sold) || 0), 0);
@@ -271,66 +270,36 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
   const generatedEmail = `${full_name.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Math.floor(100+Math.random()*900)}@erp.com`;
   const newReqId = `req_${Date.now()}`;
 
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
   // Dynamically resolve referrer's warehouse_id and parent_id
   let resolvedWarehouseId = null;
   let resolvedParentId = null;
 
-  const referrerUser = (mockDb.users || []).find(u => u.id === referrer_id);
-  if (referrerUser) {
-    resolvedWarehouseId = referrerUser.warehouse_id || null;
-    resolvedParentId = referrerUser.parent_id || null;
-  }
-
-  if (state.isSupabaseConfigured) {
-    try {
-      if (referrer_id && UUID_REGEX.test(referrer_id)) {
-        const { data: dbUser } = await supabase
-          .from('users')
-          .select('warehouse_id, parent_id')
-          .eq('id', referrer_id)
-          .maybeSingle();
-        if (dbUser) {
-          if (dbUser.warehouse_id) resolvedWarehouseId = dbUser.warehouse_id;
-          if (dbUser.parent_id) resolvedParentId = dbUser.parent_id;
-        }
+  try {
+    if (referrer_id && UUID_REGEX.test(referrer_id)) {
+      const { data: dbUser } = await supabase
+        .from('users')
+        .select('warehouse_id, parent_id')
+        .eq('id', referrer_id)
+        .maybeSingle();
+      if (dbUser) {
+        if (dbUser.warehouse_id) resolvedWarehouseId = dbUser.warehouse_id;
+        if (dbUser.parent_id) resolvedParentId = dbUser.parent_id;
       }
+    }
 
-      // Ensure warehouse_id is a valid UUID
-      if (!resolvedWarehouseId || !UUID_REGEX.test(String(resolvedWarehouseId))) {
-        const { data: firstWh } = await supabase.from('warehouses').select('id').limit(1).maybeSingle();
-        if (firstWh && firstWh.id) resolvedWarehouseId = firstWh.id;
-      }
+    if (!resolvedWarehouseId || !UUID_REGEX.test(String(resolvedWarehouseId))) {
+      const { data: firstWh } = await supabase.from('warehouses').select('id').limit(1).maybeSingle();
+      if (firstWh && firstWh.id) resolvedWarehouseId = firstWh.id;
+    }
 
-      // Ensure parent_id is a valid UUID
-      if (resolvedParentId && !UUID_REGEX.test(String(resolvedParentId))) {
-        resolvedParentId = null;
-      }
-      if (!resolvedParentId && referrer_id && UUID_REGEX.test(referrer_id)) {
-        resolvedParentId = referrer_id;
-      }
-    } catch (_) {}
-  }
+    if (resolvedParentId && !UUID_REGEX.test(String(resolvedParentId))) {
+      resolvedParentId = null;
+    }
+    if (!resolvedParentId && referrer_id && UUID_REGEX.test(referrer_id)) {
+      resolvedParentId = referrer_id;
+    }
+  } catch (_) {}
 
-  // 1. Create Onboarding Request in Super Admin's Approval Queue
-  const newReq = {
-    id: newReqId,
-    name: full_name,
-    email: generatedEmail,
-    phone,
-    role: 'salesman',
-    warehouse_id: resolvedWarehouseId,
-    parent_id: resolvedParentId,
-    requested_by: referrer_id || null,
-    status: 'pending',
-    requires_password_setup: true,
-    aadhaar_number: '',
-    kyc_doc: kyc_doc || '',
-    created_at: new Date().toISOString()
-  };
-
-  // 2. Track in salesman's referrals list
   const newReferral = {
     id: `sm_ref_${Date.now()}`,
     referrer_id: referrer_id || null,
@@ -345,33 +314,24 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
     created_at: new Date().toISOString()
   };
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data: dbReq } = await supabase.from('user_creation_requests').insert([{
-        name: full_name,
-        email: generatedEmail,
-        role: 'salesman',
-        warehouse_id: resolvedWarehouseId,
-        parent_id: resolvedParentId,
-        requested_by: referrer_id && UUID_REGEX.test(referrer_id) ? referrer_id : null,
-        status: 'pending'
-      }]).select().single();
-      if (dbReq && dbReq.id) {
-        newReq.id = dbReq.id;
-        newReferral.referred_salesman_id = dbReq.id;
-      }
-    } catch (e) {
-      console.warn('user_creation_requests Supabase sync notice:', e.message);
+  try {
+    const { data: dbReq } = await supabase.from('user_creation_requests').insert([{
+      name: full_name,
+      email: generatedEmail,
+      role: 'salesman',
+      warehouse_id: resolvedWarehouseId,
+      parent_id: resolvedParentId,
+      requested_by: referrer_id && UUID_REGEX.test(referrer_id) ? referrer_id : null,
+      status: 'pending'
+    }]).select().single();
+    if (dbReq && dbReq.id) {
+      newReferral.referred_salesman_id = dbReq.id;
     }
+  } catch (e) {
+    console.warn('user_creation_requests Supabase sync notice:', e.message);
   }
 
-  if (!mockDb.userRequests) mockDb.userRequests = [];
-  mockDb.userRequests.unshift(newReq);
-
-  if (!mockDb.salesmanReferrals) mockDb.salesmanReferrals = [];
-  mockDb.salesmanReferrals.unshift(newReferral);
-
-  await logAudit(referrer_id || 'system', 'Salesman', 'SUBMIT_REFERRAL', 'user_creation_requests', newReqId, `Submitted referral request for ${full_name} (${phone}) awaiting Super Admin approval`);
+  await logAudit(referrer_id || 'system', 'Salesman', 'SUBMIT_REFERRAL', 'user_creation_requests', newReferral.referred_salesman_id, `Submitted referral request for ${full_name} (${phone}) awaiting Super Admin approval`);
   return res.status(201).json(newReferral);
 });
 
@@ -382,44 +342,42 @@ router.get('/api/store-admin/earnings/:user_id', storeAdminGeneralLimiter, async
   let totalDispatched = 0;
   let storeComms = [];
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data: dbUser } = await supabase.from('users').select('warehouse_id').eq('id', user_id).maybeSingle();
-      const warehouseId = dbUser?.warehouse_id;
+  try {
+    const { data: dbUser } = await supabase.from('users').select('warehouse_id').eq('id', user_id).maybeSingle();
+    const warehouseId = dbUser?.warehouse_id;
 
-      // 1. Fetch direct workforce commissions
-      const query = warehouseId
-        ? supabase.from('workforce_commissions').select('*').or(`user_id.eq.${user_id},user_id.eq.${warehouseId}`)
-        : supabase.from('workforce_commissions').select('*').eq('user_id', user_id);
-      const { data: comms } = await query;
+    // 1. Fetch direct workforce commissions
+    const query = warehouseId
+      ? supabase.from('workforce_commissions').select('*').or(`user_id.eq.${user_id},user_id.eq.${warehouseId}`)
+      : supabase.from('workforce_commissions').select('*').eq('user_id', user_id);
+    const { data: comms } = await query;
 
-      if (comms && comms.length > 0) {
-        storeComms = comms;
-        todayEarned = comms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
-        totalDispatched = comms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
-      } else if (warehouseId) {
-        // Dynamic calculation from completed stock transfers from this warehouse
-        const { data: trs } = await supabase
-          .from('stock_transfers')
-          .select('*, product:products(*)')
-          .or(`from_id.eq.${warehouseId},from_id.eq.${user_id}`)
-          .eq('status', 'completed');
-        if (trs && trs.length > 0) {
-          trs.forEach(t => {
-            const q = Number(t.quantity) || 0;
-            const rate = Number(t.product?.store_admin_commission) || 0.0;
-            totalDispatched += q;
-            todayEarned += q * rate;
-          });
-        }
+    if (comms && comms.length > 0) {
+      storeComms = comms;
+      todayEarned = comms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
+      totalDispatched = comms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
+    } else if (warehouseId) {
+      // Dynamic calculation from completed stock transfers from this warehouse
+      const { data: trs } = await supabase
+        .from('stock_transfers')
+        .select('*, product:products(*)')
+        .or(`from_id.eq.${warehouseId},from_id.eq.${user_id}`)
+        .eq('status', 'completed');
+      if (trs && trs.length > 0) {
+        trs.forEach(t => {
+          const q = Number(t.quantity) || 0;
+          const rate = Number(t.product?.store_admin_commission) || 0.0;
+          totalDispatched += q;
+          todayEarned += q * rate;
+        });
       }
-    } catch (e) {
-      console.warn('Store admin earnings Supabase error:', e.message);
     }
+  } catch (e) {
+    console.warn('Store admin earnings Supabase error:', e.message);
   }
 
   if (storeComms.length === 0 && todayEarned === 0) {
-    const mockComms = (mockDb.workforceCommissions || []).filter(c => c.user_id === user_id && c.role === 'store_admin');
+    const mockComms = runtimeCommissions.filter(c => c.user_id === user_id && c.role === 'store_admin');
     todayEarned = mockComms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
     totalDispatched = mockComms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
     storeComms = mockComms;

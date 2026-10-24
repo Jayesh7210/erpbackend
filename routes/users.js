@@ -1,85 +1,45 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
-const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { unlockAccount } = require('../services/authService');
 const { superAdminGeneralLimiter, superAdminSensitiveLimiter, salesmanDutyLimiter } = require('../services/rateLimiter');
+
+const enrichUser = (u) => ({
+  ...u,
+  phone: u.phone || '',
+  password: u.password || '',
+  requires_password_setup: u.requires_password_setup === true,
+  aadhaar_number: u.aadhaar_number || '',
+  aadhaar_doc: u.aadhaar_doc || '',
+  kyc_status: u.kyc_status || (u.aadhaar_doc ? 'Verified' : 'Pending')
+});
 
 // List all workforce users (Protected by General Admin Rate Limiter)
 router.get('/api/users', superAdminGeneralLimiter, async (req, res) => {
   const { role, status, search } = req.query;
 
-  const enrichUser = (u) => ({
-    ...u,
-    phone: u.phone || '',
-    password: u.password || '',
-    requires_password_setup: u.requires_password_setup === true,
-    aadhaar_number: u.aadhaar_number || '',
-    aadhaar_doc: u.aadhaar_doc || '',
-    kyc_status: u.kyc_status || (u.aadhaar_doc ? 'Verified' : 'Pending')
-  });
+  try {
+    let query = supabase.from('users').select('*, warehouse:warehouses(name), parent:users!parent_id(name)');
+    if (role && role !== 'all') query = query.eq('role', role);
+    if (status && status !== 'all') query = query.eq('status', status);
+    if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
 
-  if (state.isSupabaseConfigured) {
-    try {
-      let query = supabase.from('users').select('*, warehouse:warehouses(name), parent:users!parent_id(name)');
-      if (role && role !== 'all') query = query.eq('role', role);
-      if (status && status !== 'all') query = query.eq('status', status);
-      if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
-
-      const { data, error } = await query;
-      if (error) throw error;
-      const enriched = (data || []).map(enrichUser);
-
-      // Merge any users in mockDb that are not in Supabase
-      const seenIds = new Set(enriched.map(u => String(u.id)));
-      const seenEmails = new Set(enriched.map(u => String(u.email || '').toLowerCase()));
-
-      for (const mu of (mockDb.users || [])) {
-        const mEmail = String(mu.email || '').toLowerCase();
-        if (!seenIds.has(String(mu.id)) && (!mEmail || !seenEmails.has(mEmail))) {
-          if (role && role !== 'all' && mu.role !== role) continue;
-          if (status && status !== 'all' && mu.status !== status) continue;
-          if (search) {
-            const s = search.toLowerCase();
-            const matches = (mu.name || '').toLowerCase().includes(s) || mEmail.includes(s) || (mu.phone && mu.phone.includes(s));
-            if (!matches) continue;
-          }
-          const wh = (mockDb.warehouses || []).find(w => w.id === mu.warehouse_id);
-          const parent = (mockDb.users || []).find(p => p.id === mu.parent_id);
-          enriched.push(enrichUser({
-            ...mu,
-            warehouse: wh ? { name: wh.name } : null,
-            parent: parent ? { name: parent.name } : null
-          }));
-        }
-      }
-
-      return res.json(enriched);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+    const { data, error } = await query;
+    if (error) {
+      // Fallback without joins if relation fails
+      let fallbackQuery = supabase.from('users').select('*');
+      if (role && role !== 'all') fallbackQuery = fallbackQuery.eq('role', role);
+      if (status && status !== 'all') fallbackQuery = fallbackQuery.eq('status', status);
+      if (search) fallbackQuery = fallbackQuery.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
+      const { data: fbData, error: fbErr } = await fallbackQuery;
+      if (fbErr) throw fbErr;
+      return res.json((fbData || []).map(enrichUser));
     }
-  } else {
-    let result = [...mockDb.users];
-    if (role && role !== 'all') result = result.filter(u => u.role === role);
-    if (status && status !== 'all') result = result.filter(u => u.status === status);
-    if (search) {
-      const s = search.toLowerCase();
-      result = result.filter(u => u.name.toLowerCase().includes(s) || u.email.toLowerCase().includes(s) || (u.phone && u.phone.includes(s)));
-    }
-
-    const resolved = result.map(u => {
-      const wh = mockDb.warehouses.find(w => w.id === u.warehouse_id);
-      const parent = mockDb.users.find(p => p.id === u.parent_id);
-      const base = {
-        ...u,
-        warehouse: wh ? { name: wh.name } : null,
-        parent: parent ? { name: parent.name } : null
-      };
-      return enrichUser(base);
-    });
-    return res.json(resolved);
+    const enriched = (data || []).map(enrichUser);
+    return res.json(enriched);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -99,85 +59,52 @@ router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
   const aadhNumber = (aadhaar_number || '').trim();
   const aadhDoc = (aadhaar_doc || '').trim();
 
-  if (state.isSupabaseConfigured) {
+  try {
+    const userPayload = {
+      name,
+      email,
+      role,
+      warehouse_id: warehouse_id || null,
+      parent_id: parent_id || null,
+      status: 'approved'
+    };
+    if (phone) userPayload.phone = phone;
+    if (assignedPassword) userPayload.password = assignedPassword;
+    if (aadhNumber) userPayload.aadhaar_number = aadhNumber;
+    if (aadhDoc) userPayload.aadhaar_doc = aadhDoc;
+
+    let insertedData = null;
     try {
-      const userPayload = {
-        name,
-        email,
-        role,
-        warehouse_id: warehouse_id || null,
-        parent_id: parent_id || null,
-        status: 'approved'
-      };
-      if (phone) userPayload.phone = phone;
-      if (assignedPassword) userPayload.password = assignedPassword;
-      if (aadhNumber) userPayload.aadhaar_number = aadhNumber;
-      if (aadhDoc) userPayload.aadhaar_doc = aadhDoc;
+      const { data, error } = await supabase.from('users').insert([userPayload]).select().single();
+      if (error) throw error;
+      insertedData = data;
+    } catch (_) {
+      const { data, error: fbErr } = await supabase.from('users').insert([{
+        name, email, role, warehouse_id: warehouse_id || null, parent_id: parent_id || null, status: 'approved'
+      }]).select().single();
+      if (fbErr) throw fbErr;
+      insertedData = data;
+    }
 
-      let insertedData = null;
+    if (role === 'customer' || role === 'distributor') {
       try {
-        const { data, error } = await supabase.from('users').insert([userPayload]).select().single();
-        if (error) throw error;
-        insertedData = data;
-      } catch (_) {
-        const { data, error: fbErr } = await supabase.from('users').insert([{
-          name, email, role, warehouse_id: warehouse_id || null, parent_id: parent_id || null, status: 'approved'
-        }]).select().single();
-        if (fbErr) throw fbErr;
-        insertedData = data;
-      }
-
-      if (role === 'customer' || role === 'distributor') {
         const refCode = `${name.replace(/[^a-zA-Z]/g, '').toUpperCase().slice(0, 6)}${Math.floor(100 + Math.random() * 900)}`;
         await supabase.from('customers').insert([{
           name, phone, email, customer_type: role === 'distributor' ? 'distributor' : 'retail', referral_code: refCode, created_by: insertedData.id
         }]);
-      }
-
-      await logAudit(admin_id, admin_name, 'CREATE_USER', 'users', insertedData.id, `Created ${role} account for ${name} (${email})`);
-      return res.status(201).json({
-        ...insertedData,
-        phone: phone || '',
-        password: assignedPassword,
-        aadhaar_number: aadhNumber,
-        aadhaar_doc: aadhDoc
-      });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+      } catch (_) {}
     }
-  } else {
-    const newUser = {
-      id: `u_${Date.now()}`,
-      name,
-      email,
+
+    await logAudit(admin_id, admin_name, 'CREATE_USER', 'users', insertedData.id, `Created ${role} account for ${name} (${email})`);
+    return res.status(201).json({
+      ...insertedData,
       phone: phone || '',
-      role,
-      warehouse_id: warehouse_id || null,
-      parent_id: parent_id || null,
-      status: 'approved',
       password: assignedPassword,
       aadhaar_number: aadhNumber,
-      aadhaar_doc: aadhDoc,
-      created_at: new Date()
-    };
-    mockDb.users.push(newUser);
-
-    if (role === 'customer' || role === 'distributor') {
-      const refCode = `${name.replace(/[^a-zA-Z]/g, '').toUpperCase().slice(0, 6)}${Math.floor(100 + Math.random() * 900)}`;
-      mockDb.customers.push({
-        id: `c_${Date.now()}`,
-        name,
-        phone: phone || '',
-        email,
-        customer_type: role === 'distributor' ? 'distributor' : 'retail',
-        referral_code: refCode,
-        referred_by: null,
-        created_by: newUser.id
-      });
-    }
-
-    await logAudit(admin_id, admin_name, 'CREATE_USER', 'users', newUser.id, `Created ${role} account for ${name} (${email})`);
-    return res.status(201).json(newUser);
+      aadhaar_doc: aadhDoc
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -189,28 +116,23 @@ router.post('/api/users/:id/reset-password', superAdminSensitiveLimiter, async (
     return res.status(400).json({ error: 'Password must be at least 4 characters.' });
   }
 
-  let user = null;
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabase.from('users')
-        .update({ password: password.trim() })
-        .eq('id', id)
-        .select()
-        .single();
-      if (!error && data) user = data;
-    } catch (_) {}
-  }
-  if (!user) {
-    user = mockDb.users.find(u => u.id === id);
-    if (user) user.password = password.trim();
-  }
-  if (!user) {
-    return res.status(404).json({ error: 'User not found.' });
-  }
+  try {
+    const { data: user, error } = await supabase.from('users')
+      .update({ password: password.trim() })
+      .eq('id', id)
+      .select()
+      .single();
 
-  unlockAccount(user);
-  await logAudit(admin_id, admin_name, 'RESET_PASSWORD', 'users', id, `Super Admin updated password for ${user.name} (${user.email})`);
-  return res.json({ success: true, message: `Password for ${user.name} has been updated to "${password.trim()}".` });
+    if (error || !user) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    unlockAccount(user);
+    await logAudit(admin_id, admin_name, 'RESET_PASSWORD', 'users', id, `Super Admin updated password for ${user.name} (${user.email})`);
+    return res.json({ success: true, message: `Password for ${user.name} has been updated.` });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Update user details (Protected by General Admin Rate Limiter)
@@ -218,50 +140,30 @@ router.put('/api/users/:id', superAdminGeneralLimiter, async (req, res) => {
   const { id } = req.params;
   const { name, email, phone, role, warehouse_id, parent_id, status, password, aadhaar_number, aadhaar_doc, admin_id, admin_name } = req.body;
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const updateData = {};
-      if (name !== undefined) updateData.name = name;
-      if (email !== undefined) updateData.email = email;
-      if (phone !== undefined) updateData.phone = phone;
-      if (role !== undefined) updateData.role = role;
-      if (warehouse_id !== undefined) updateData.warehouse_id = warehouse_id;
-      if (parent_id !== undefined) updateData.parent_id = parent_id;
-      if (status !== undefined) updateData.status = status;
-      if (password !== undefined && password.trim().length > 0) updateData.password = password.trim();
-      if (aadhaar_number !== undefined) updateData.aadhaar_number = aadhaar_number;
-      if (aadhaar_doc !== undefined) updateData.aadhaar_doc = aadhaar_doc;
+  try {
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (role !== undefined) updateData.role = role;
+    if (warehouse_id !== undefined) updateData.warehouse_id = warehouse_id;
+    if (parent_id !== undefined) updateData.parent_id = parent_id;
+    if (status !== undefined) updateData.status = status;
+    if (password !== undefined && password.trim().length > 0) updateData.password = password.trim();
+    if (aadhaar_number !== undefined) updateData.aadhaar_number = aadhaar_number;
+    if (aadhaar_doc !== undefined) updateData.aadhaar_doc = aadhaar_doc;
 
-      const { data, error } = await supabase.from('users')
-        .update(updateData)
-        .eq('id', id)
-        .select()
-        .single();
-      if (error) throw error;
+    const { data, error } = await supabase.from('users')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) throw error;
 
-      await logAudit(admin_id, admin_name, 'UPDATE_USER', 'users', id, `Updated user ${data.name}: ${JSON.stringify(updateData)}`);
-      return res.json(data);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  } else {
-    const userIndex = mockDb.users.findIndex(u => u.id === id);
-    if (userIndex === -1) return res.status(404).json({ error: 'User not found' });
-    
-    const user = mockDb.users[userIndex];
-    if (name !== undefined) user.name = name;
-    if (email !== undefined) user.email = email;
-    if (phone !== undefined) user.phone = phone;
-    if (role !== undefined) user.role = role;
-    if (warehouse_id !== undefined) user.warehouse_id = warehouse_id;
-    if (parent_id !== undefined) user.parent_id = parent_id;
-    if (status !== undefined) user.status = status;
-    if (password !== undefined && password.trim().length > 0) user.password = password.trim();
-    if (aadhaar_number !== undefined) user.aadhaar_number = aadhaar_number;
-    if (aadhaar_doc !== undefined) user.aadhaar_doc = aadhaar_doc;
-
-    await logAudit(admin_id, admin_name, 'UPDATE_USER', 'users', id, `Updated user ${user.name} details`);
-    return res.json(user);
+    await logAudit(admin_id, admin_name, 'UPDATE_USER', 'users', id, `Updated user ${data.name}: ${JSON.stringify(updateData)}`);
+    return res.json(data);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -270,23 +172,15 @@ router.delete('/api/users/:id', superAdminSensitiveLimiter, async (req, res) => 
   const { id } = req.params;
   const { admin_id, admin_name } = req.query;
 
-  if (state.isSupabaseConfigured) {
-    try {
-      const { data: user } = await supabase.from('users').select('name').eq('id', id).single();
-      const { error } = await supabase.from('users').delete().eq('id', id);
-      if (error) throw error;
+  try {
+    const { data: user } = await supabase.from('users').select('name').eq('id', id).single();
+    const { error } = await supabase.from('users').delete().eq('id', id);
+    if (error) throw error;
 
-      await logAudit(admin_id, admin_name, 'DELETE_USER', 'users', id, `Deleted user ${user?.name || id}`);
-      return res.json({ message: 'User deleted successfully' });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  } else {
-    const idx = mockDb.users.findIndex(u => u.id === id);
-    if (idx === -1) return res.status(404).json({ error: 'User not found' });
-    const deleted = mockDb.users.splice(idx, 1)[0];
-    await logAudit(admin_id, admin_name, 'DELETE_USER', 'users', id, `Deleted user ${deleted.name}`);
+    await logAudit(admin_id, admin_name, 'DELETE_USER', 'users', id, `Deleted user ${user?.name || id}`);
     return res.json({ message: 'User deleted successfully' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -294,11 +188,21 @@ router.delete('/api/users/:id', superAdminSensitiveLimiter, async (req, res) => 
 router.put('/api/users/:id/duty', salesmanDutyLimiter, async (req, res) => {
   const { id } = req.params;
   const { is_on_duty } = req.body;
-  const user = mockDb.users.find(u => u.id === id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  user.is_on_duty = Boolean(is_on_duty);
-  await logAudit(id, user.name, 'TOGGLE_DUTY', 'users', id, `Salesman is now ${user.is_on_duty ? 'ON DUTY' : 'OFF DUTY'}`);
-  return res.json({ success: true, is_on_duty: user.is_on_duty });
+
+  try {
+    const { data: user, error: fetchErr } = await supabase.from('users').select('*').eq('id', id).maybeSingle();
+    if (fetchErr || !user) return res.status(404).json({ error: 'User not found' });
+
+    const onDuty = Boolean(is_on_duty);
+    try {
+      await supabase.from('users').update({ is_on_duty: onDuty }).eq('id', id);
+    } catch (_) {}
+
+    await logAudit(id, user.name, 'TOGGLE_DUTY', 'users', id, `Salesman is now ${onDuty ? 'ON DUTY' : 'OFF DUTY'}`);
+    return res.json({ success: true, is_on_duty: onDuty });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

@@ -1,16 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { logAudit } = require('../services/audit');
 const { superAdminAnalyticsLimiter, superAdminSensitiveLimiter } = require('../services/rateLimiter');
+
+const manualPayments = [];
 
 // Payments & Transactions History (Super Admin - Protected by Analytics Limiter)
 router.get('/api/payments', superAdminAnalyticsLimiter, async (req, res) => {
   const { type, method, status, search, start_date, end_date } = req.query;
 
-  let allPayments = [...(mockDb.payments || [])];
+  const allPayments = [...manualPayments];
 
   // Harvest from live Supabase tables if configured
   if (state.isSupabaseConfigured) {
@@ -80,85 +81,6 @@ router.get('/api/payments', superAdminAnalyticsLimiter, async (req, res) => {
       console.warn('Supabase payments query notice:', e.message);
     }
   }
-
-  // Harvest from mockDb.sales
-  const salesList = mockDb.sales || [];
-  salesList.forEach(s => {
-    if (!allPayments.some(p => p.reference_id === s.id)) {
-      const prod = (mockDb.products || []).find(p => p.id === s.product_id);
-      const cust = (mockDb.customers || []).find(c => c.id === s.customer_id);
-      const user = (mockDb.users || []).find(u => u.id === s.salesman_id);
-      allPayments.push({
-        id: `pay_${s.id}`,
-        payment_no: `PAY-SAL-${s.id.toString().slice(-5).toUpperCase()}`,
-        type: 'sale',
-        category: s.customer_type === 'distributor' ? 'Wholesale Bulk Sale' : 'Retail Customer Sale',
-        amount: parseFloat(s.amount) || 0,
-        payment_method: s.payment_method || 'online',
-        status: 'completed',
-        payer_name: cust?.name || s.customer_name || 'Walk-in Customer',
-        payer_phone: cust?.phone || s.customer_phone || '',
-        payer_type: s.customer_type || 'retail',
-        collector_name: user?.name || 'Staff Member',
-        collector_role: user?.role || 'salesman',
-        item_description: `${s.quantity}x ${prod?.name || 'Bottles'}`,
-        reference_id: s.id,
-        notes: s.referral_code ? `Referral code used: ${s.referral_code}` : 'Order payment received',
-        created_at: s.created_at || new Date().toISOString()
-      });
-    }
-  });
-
-  // Harvest from mockDb.settlements
-  const stlList = mockDb.settlements || [];
-  stlList.forEach(stl => {
-    if (!allPayments.some(p => p.reference_id === stl.id)) {
-      const u = (mockDb.users || []).find(usr => usr.id === stl.salesman_id);
-      allPayments.push({
-        id: `pay_${stl.id}`,
-        payment_no: `PAY-STL-${stl.id.toString().slice(-5).toUpperCase()}`,
-        type: 'settlement',
-        category: 'Daily Cash Settlement',
-        amount: parseFloat(stl.cash_collected || stl.sold_amount || 0),
-        payment_method: 'cash',
-        status: (stl.status === 'settled' || stl.status === 'tally_zero') ? 'completed' : 'pending',
-        payer_name: u ? `${u.name} (Salesman)` : 'Salesman Deposit',
-        payer_phone: u?.phone || '',
-        payer_type: 'salesman',
-        collector_name: 'Field Sales Manager / Depot',
-        collector_role: 'manager',
-        item_description: `Evening Cash Handover (${stl.bottles_sold || 0} btls sold)`,
-        reference_id: stl.id,
-        notes: `Difference: ₹${stl.difference || 0}`,
-        created_at: stl.created_at || new Date().toISOString()
-      });
-    }
-  });
-
-  // Harvest from paid referrals
-  const refList = mockDb.referrals || [];
-  refList.filter(r => r.status === 'paid').forEach(r => {
-    if (!allPayments.some(p => p.reference_id === r.id)) {
-      allPayments.push({
-        id: `pay_${r.id}`,
-        payment_no: `PAY-REF-${r.id.toString().slice(-5).toUpperCase()}`,
-        type: 'referral_payout',
-        category: 'Referral Bonus Disbursement',
-        amount: parseFloat(r.bonus_amount || 50),
-        payment_method: 'online',
-        status: 'completed',
-        payer_name: 'Sanap ERP Treasury',
-        payer_phone: '',
-        payer_type: 'system',
-        collector_name: r.referrer_name || 'Referrer Partner',
-        collector_role: 'customer',
-        item_description: `Referral Reward for ${r.referred_name || 'Customer'}`,
-        reference_id: r.id,
-        notes: 'Bonus Payout Processed',
-        created_at: r.created_at || new Date().toISOString()
-      });
-    }
-  });
 
   // Apply filters
   let filtered = [...allPayments];
@@ -249,10 +171,9 @@ router.post('/api/payments', superAdminSensitiveLimiter, async (req, res) => {
     created_at: new Date().toISOString()
   };
 
-  if (!mockDb.payments) mockDb.payments = [];
-  mockDb.payments.unshift(newPay);
+  manualPayments.unshift(newPay);
 
-  await logAudit(admin_id || 'u1', admin_name || 'Super Admin', 'CREATE_PAYMENT', 'payments', newPay.id, `Logged payment of ₹${amount} from ${payer_name} via ${payment_method}`);
+  await logAudit(admin_id, admin_name || 'Super Admin', 'CREATE_PAYMENT', 'payments', newPay.id, `Logged payment of ₹${amount} from ${payer_name} via ${payment_method}`);
   return res.status(201).json(newPay);
 });
 

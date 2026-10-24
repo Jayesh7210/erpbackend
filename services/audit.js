@@ -1,32 +1,38 @@
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Centralized Audit Logger
 async function logAudit(userId, userName, action, entityName, entityId, details) {
+  const safeUserId = (userId && UUID_REGEX.test(String(userId))) ? String(userId) : null;
+  const isUuidEntity = entityId && UUID_REGEX.test(String(entityId));
+  const safeEntityId = isUuidEntity ? String(entityId) : null;
+
+  let detailsStr = typeof details === 'object' ? JSON.stringify(details) : String(details || '');
+  if (!isUuidEntity && entityId) {
+    detailsStr = `[Ref: ${entityId}] ${detailsStr}`;
+  }
+  if (userName) {
+    detailsStr = `[${userName}] ${detailsStr}`;
+  }
+
   const logEntry = {
-    id: `aud_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-    user_id: userId || 'u1',
-    user_name: userName || 'Super Admin',
-    action,
-    entity_name: entityName,
-    entity_id: entityId || null,
-    details: typeof details === 'object' ? JSON.stringify(details) : String(details),
-    created_at: new Date()
+    user_id: safeUserId,
+    action: action || 'UNKNOWN',
+    entity_name: entityName || 'general',
+    entity_id: safeEntityId,
+    details: detailsStr
   };
-  mockDb.audit_logs.unshift(logEntry);
-  if (state.isSupabaseConfigured) {
+
+  if (state.isSupabaseConfigured || (process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY))) {
     try {
-      await supabase.from('audit_logs').insert([{
-        user_id: logEntry.user_id,
-        user_name: logEntry.user_name,
-        action: logEntry.action,
-        entity_name: logEntry.entity_name,
-        entity_id: logEntry.entity_id,
-        details: logEntry.details
-      }]);
+      const { error } = await supabase.from('audit_logs').insert([logEntry]);
+      if (error) {
+        console.warn('Failed to insert audit log into Supabase:', error.message);
+      }
     } catch (err) {
-      console.warn('Failed to insert audit log into Supabase:', err.message);
+      console.warn('Audit log exception:', err.message);
     }
   }
   return logEntry;
@@ -35,3 +41,4 @@ async function logAudit(userId, userName, action, entityName, entityId, details)
 module.exports = {
   logAudit
 };
+

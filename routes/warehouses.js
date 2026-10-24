@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 const { superAdminGeneralLimiter, superAdminSensitiveLimiter } = require('../services/rateLimiter');
 
@@ -18,11 +17,8 @@ router.post('/api/warehouses', superAdminSensitiveLimiter, async (req, res) => {
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
-  } else {
-    const newWarehouse = { id: `w_${Date.now()}`, name, location, created_at: new Date() };
-    mockDb.warehouses.push(newWarehouse);
-    return res.status(201).json(newWarehouse);
   }
+  return res.status(500).json({ error: 'Database is not configured' });
 });
 
 // List Warehouses (Protected by General Admin Rate Limiter)
@@ -31,13 +27,12 @@ router.get('/api/warehouses', superAdminGeneralLimiter, async (req, res) => {
     try {
       const { data, error } = await supabase.from('warehouses').select('*').order('created_at', { ascending: false });
       if (error) throw error;
-      return res.json(data);
+      return res.json(data || []);
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
-  } else {
-    return res.json(mockDb.warehouses);
   }
+  return res.json([]);
 });
 
 // Update Warehouse (Protected by General Admin Rate Limiter)
@@ -59,12 +54,8 @@ router.put('/api/warehouses/:id', superAdminGeneralLimiter, async (req, res) => 
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
-  } else {
-    const idx = mockDb.warehouses.findIndex(w => w.id === id);
-    if (idx === -1) return res.status(404).json({ error: 'Warehouse not found' });
-    mockDb.warehouses[idx] = { ...mockDb.warehouses[idx], name, location };
-    return res.json(mockDb.warehouses[idx]);
   }
+  return res.status(500).json({ error: 'Database is not configured' });
 });
 
 // Delete Warehouse (Protected by Sensitive Admin Rate Limiter)
@@ -84,10 +75,8 @@ router.delete('/api/warehouses/:id', superAdminSensitiveLimiter, async (req, res
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
-  } else {
-    mockDb.warehouses = mockDb.warehouses.filter(w => w.id !== id);
-    return res.json({ message: 'Warehouse deleted successfully' });
   }
+  return res.status(500).json({ error: 'Database is not configured' });
 });
 
 module.exports = router;

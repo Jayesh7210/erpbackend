@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const { supabaseAdmin: supabase } = require('../db');
-const mockDb = require('../data/mockDb');
 const { state } = require('../data/state');
 
 // Product metadata cache (persisted locally for availability, pricing & alerts)
@@ -24,9 +23,17 @@ function saveProductMeta() {
   }
 }
 
-function getProductWithMeta(productId) {
+async function getProductWithMeta(productId) {
   if (!productId) return null;
-  const prod = (mockDb.products || []).find(p => p.id === productId);
+  let prod = null;
+  if (typeof productId === 'object' && productId.id) {
+    prod = productId;
+  } else if (state.isSupabaseConfigured) {
+    try {
+      const { data } = await supabase.from('products').select('*').eq('id', productId).maybeSingle();
+      if (data) prod = data;
+    } catch (_) {}
+  }
   if (!prod) return null;
   const meta = productMeta[prod.id] || productMeta[prod.sku] || {};
   return {
@@ -54,12 +61,6 @@ async function getDefaultProductUnitPrice() {
     } catch (e) {
       console.warn('Error fetching default product price from supabase:', e.message);
     }
-  }
-  const first = mockDb.products?.[0];
-  if (first) {
-    const meta = productMeta[first.id] || productMeta[first.sku] || {};
-    const price = meta.base_price !== undefined ? meta.base_price : (first.base_price || 0.0);
-    if (price > 0) return Number(price);
   }
   return 0.0;
 }
