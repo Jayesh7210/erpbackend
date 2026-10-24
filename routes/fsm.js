@@ -16,6 +16,7 @@ router.get('/api/fsm/dashboard/:fsm_id', fsmGeneralLimiter, async (req, res) => 
   const fsmId = req.params.fsm_id;
   let supervised = [];
   const salesMap = new Map();
+  const smStockMap = new Map();
   let totalStock = 0;
   let totalReceived = 0;
 
@@ -40,19 +41,24 @@ router.get('/api/fsm/dashboard/:fsm_id', fsmGeneralLimiter, async (req, res) => 
       );
     }
 
-    // 4. Query live sales from Supabase
+    // 4. Query live sales and live team stocks from Supabase
     const smIds = supervised.map(u => u.id);
     if (smIds.length > 0) {
       const { data: salesList } = await supabase.from('sales').select('salesman_id, quantity').in('salesman_id', smIds);
       (salesList || []).forEach(s => {
         salesMap.set(s.salesman_id, (salesMap.get(s.salesman_id) || 0) + (Number(s.quantity) || 0));
       });
+
+      const { data: smStocks } = await supabase.from('stocks').select('owner_id, quantity').in('owner_id', smIds);
+      (smStocks || []).forEach(st => {
+        smStockMap.set(st.owner_id, (smStockMap.get(st.owner_id) || 0) + (Number(st.quantity) || 0));
+      });
     }
   } catch (_) {}
 
   // Calculate dynamic sales and allocation
   const totalBottlesSold = supervised.reduce((sum, s) => sum + (salesMap.get(s.id) ?? (Number(s.sold_today) || 0)), 0);
-  const totalAllocated = supervised.reduce((sum, s) => sum + (Number(s.current_stock) || 0), 0);
+  const totalAllocated = supervised.reduce((sum, s) => sum + (smStockMap.get(s.id) ?? (Number(s.current_stock) || 0)), 0);
 
   // Dynamic FSM commissions from stock allocations to salesmen
   let todayEarned = 0;
@@ -96,7 +102,7 @@ router.get('/api/fsm/dashboard/:fsm_id', fsmGeneralLimiter, async (req, res) => 
       bottles: totalBottlesSold
     },
     stock_accountability: {
-      received: totalReceived || (totalStock + totalAllocated),
+      received: Math.max(totalReceived, totalStock + totalAllocated + totalBottlesSold),
       allocated: totalAllocated,
       sold: totalBottlesSold,
       remaining: totalStock || fsmSettlementHub.depot_stock || 0

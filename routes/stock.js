@@ -486,6 +486,20 @@ router.post('/api/stock/transfer', storeAdminTransactionLimiter, async (req, res
       .eq('owner_id', from_id)
       .eq('product_id', product_id)
       .maybeSingle();
+
+    if (!senderStock) {
+      // Fallback: If sender has stock record for another product or unassigned product, locate it
+      const { data: anyStock } = await supabase.from('stocks')
+        .select('*')
+        .eq('owner_id', from_id)
+        .order('quantity', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (anyStock) {
+        senderStock = anyStock;
+        product_id = anyStock.product_id;
+      }
+    }
     
     if (sendErr || !senderStock) {
       return res.status(400).json({ error: 'Insufficient stock at source: No stock found' });
