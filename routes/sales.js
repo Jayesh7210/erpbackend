@@ -17,13 +17,26 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
   try {
     const { data: u } = await supabase.from('users').select('*').eq('id', salesman_id).maybeSingle();
     seller = u;
-    if (seller && seller.referrer_id) {
-      const { data: ref } = await supabase.from('users').select('*').eq('id', seller.referrer_id).maybeSingle();
+    let referrerId = seller ? seller.referrer_id : null;
+    if (!referrerId && seller) {
+      const { data: req } = await supabase
+        .from('user_creation_requests')
+        .select('requested_by')
+        .or(`email.eq.${seller.email},name.eq.${seller.name}`)
+        .maybeSingle();
+      if (req && req.requested_by) {
+        referrerId = req.requested_by;
+        await supabase.from('users').update({ referrer_id: referrerId }).eq('id', seller.id);
+      }
+    }
+
+    if (referrerId) {
+      const { data: ref } = await supabase.from('users').select('*').eq('id', referrerId).maybeSingle();
       referrer = ref;
     }
   } catch (_) {}
 
-  const product = getProductWithMeta(product_id);
+  const product = await getProductWithMeta(product_id);
 
   // 1. Direct Commission for Salesman (selling to customer)
   if (seller && product) {
@@ -62,47 +75,60 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
   }
 
   // 2. Direct Referral Bonus (Strictly 1-Level: Salesman A refers Salesman B -> Salesman A gets referral commission)
-  if (seller && seller.referrer_id && product) {
-    if (referrer && referrer.role === 'salesman') {
-      const referralRate = Number(product.referral_commission) || 0.0;
-      const commAmount = saleQty * referralRate;
+  if (seller && referrer && referrer.role === 'salesman' && product) {
+    const referralRate = Number(product.referral_commission) || 10.0;
+    const commAmount = saleQty * referralRate;
 
-      if (commAmount > 0) {
-        const newComm = {
-          id: `w_comm_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`,
-          role: 'salesman',
-          type: 'referral_bonus',
-          referrer_id: seller.referrer_id,
+    if (commAmount > 0) {
+      let isUnlocked = true;
+      let refSoldToday = 0;
+      let minQuota = 0;
+      try {
+        const { data: refSalesToday } = await supabase.from('sales').select('quantity').eq('salesman_id', referrer.id);
+        refSoldToday = (refSalesToday || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+        const isQuotaActive = Boolean(referrer.is_quota_condition_active);
+        minQuota = Number(referrer.min_sales_quota) || 0;
+        isUnlocked = !isQuotaActive || minQuota === 0 || refSoldToday >= minQuota;
+      } catch (_) {}
+
+      const commStatus = isUnlocked ? 'unlocked' : 'quota_pending';
+
+      const newComm = {
+        id: `w_comm_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`,
+        role: 'salesman',
+        type: 'referral_bonus',
+        referrer_id: referrer.id,
+        referrer_name: referrer.name,
+        seller_id: seller.id,
+        seller_name: seller.name,
+        bottles_sold: saleQty,
+        rate_per_bottle: referralRate,
+        commission_amount: commAmount,
+        status: commStatus,
+        sale_id: saleId,
+        product_id: product.id,
+        product_name: product.name,
+        created_at: new Date().toISOString(),
+        paid_at: null
+      };
+
+      addCommission(newComm);
+
+      try {
+        await supabase.from('workforce_commissions').insert([{
+          referrer_id: referrer.id,
           referrer_name: referrer.name,
           seller_id: seller.id,
           seller_name: seller.name,
+          sale_id: saleId || null,
           bottles_sold: saleQty,
           rate_per_bottle: referralRate,
           commission_amount: commAmount,
-          status: 'unlocked',
-          sale_id: saleId,
-          product_id: product.id,
-          product_name: product.name,
-          created_at: new Date().toISOString(),
-          paid_at: null
-        };
-
-        addCommission(newComm);
-
-        try {
-          await supabase.from('workforce_commissions').insert([{
-            referrer_id: seller.referrer_id,
-            referrer_name: referrer.name,
-            seller_id: seller.id,
-            seller_name: seller.name,
-            sale_id: saleId || null,
-            bottles_sold: saleQty,
-            rate_per_bottle: referralRate,
-            commission_amount: commAmount,
-            status: 'unlocked'
-          }]);
-        } catch (_) {}
-      }
+          status: commStatus,
+          referrer_sales_today: refSoldToday,
+          min_quota_required: minQuota
+        }]);
+      } catch (_) {}
     }
   }
 }

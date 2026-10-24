@@ -207,6 +207,10 @@ router.post('/api/workforce/approve', superAdminSensitiveLimiter, async (req, re
       const aadhaarNo = reqObj.aadhaar_number || 'Not Provided';
       const aadhaarDoc = reqObj.kyc_doc || reqObj.aadhaar_doc || 'Aadhaar_Document.pdf';
 
+      const referrerId = (reqObj.requested_by && UUID_REGEX.test(reqObj.requested_by))
+        ? reqObj.requested_by
+        : (reqObj.referrer_id && UUID_REGEX.test(reqObj.referrer_id) ? reqObj.referrer_id : null);
+
       // Check if user already exists
       const { data: existingUser } = await supabase.from('users').select('*').eq('email', userEmail).maybeSingle();
       if (existingUser) {
@@ -215,6 +219,7 @@ router.post('/api/workforce/approve', superAdminSensitiveLimiter, async (req, re
           role: userRole,
           warehouse_id: warehouse_id || existingUser.warehouse_id,
           parent_id: parent_id || existingUser.parent_id,
+          referrer_id: referrerId || existingUser.referrer_id,
           phone: userPhone || existingUser.phone,
           password: userPassword || existingUser.password,
           requires_password_setup: true
@@ -227,6 +232,7 @@ router.post('/api/workforce/approve', superAdminSensitiveLimiter, async (req, re
           role: userRole,
           warehouse_id: warehouse_id,
           parent_id: parent_id,
+          referrer_id: referrerId,
           status: 'approved',
           requires_password_setup: true,
           phone: userPhone,
@@ -244,6 +250,7 @@ router.post('/api/workforce/approve', superAdminSensitiveLimiter, async (req, re
             role: userRole,
             warehouse_id: warehouse_id,
             parent_id: parent_id,
+            referrer_id: referrerId,
             status: 'approved'
           }]).select().single();
           if (minErr) throw minErr;

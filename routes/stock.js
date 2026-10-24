@@ -36,7 +36,7 @@ async function processTransferCommission(transfer) {
     }
   } catch (_) {}
 
-  const product = getProductWithMeta(transfer.product_id);
+  const product = await getProductWithMeta(transfer.product_id);
   if (!product) return;
 
   const isSenderStoreAdmin = senderUser && senderUser.role === 'store_admin';

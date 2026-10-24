@@ -142,10 +142,9 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
   const { salesman_id } = req.params;
   let user = null;
   let todaySales = [];
-  let myReferralComms = runtimeCommissions.filter(c => c.referrer_id === salesman_id && c.type === 'referral_bonus');
 
   try {
-    // 1. Fetch user duty & details
+    // 1. Fetch user details & quota rules
     const { data: dbUser } = await supabase
       .from('users')
       .select('id, name, email, is_on_duty, role, parent_id, warehouse_id, min_sales_quota, is_quota_condition_active')
@@ -153,22 +152,13 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
       .maybeSingle();
     if (dbUser) user = dbUser;
 
-    // 2. Fetch sales from Supabase
+    // 2. Fetch today's sales for this salesman
     const { data: dbSales } = await supabase
       .from('sales')
       .select('*')
       .eq('salesman_id', salesman_id);
     if (dbSales && dbSales.length > 0) {
       todaySales = dbSales;
-    }
-
-    // 3. Fetch workforce commissions for referrals if table exists
-    const { data: dbComms } = await supabase
-      .from('workforce_commissions')
-      .select('*')
-      .eq('referrer_id', salesman_id);
-    if (dbComms && dbComms.length > 0) {
-      myReferralComms = dbComms;
     }
   } catch (e) {
     console.warn('salesman earnings Supabase query warning:', e.message);
@@ -178,17 +168,66 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
 
   // Dynamic direct sale commissions from products sold
   let directCommissionEarned = 0;
-  todaySales.forEach(s => {
-    const prod = getProductWithMeta(s.product_id);
-    const rate = Number(prod?.salesman_commission) || 0.0;
+  for (const s of todaySales) {
+    const prod = await getProductWithMeta(s.product_id);
+    const rate = Number(prod?.salesman_commission) || 50.0;
     directCommissionEarned += (Number(s.quantity) || 0) * rate;
-  });
+  }
 
   // Dynamic referral commissions from direct downline referrals (Strictly 1-Level)
-  const downlineBottles = myReferralComms.reduce((sum, c) => sum + (Number(c.bottles_sold) || 0), 0);
-  const unlockedReferralEarned = myReferralComms
-    .filter(c => c.status === 'unlocked' || c.status === 'paid')
-    .reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
+  let downlineBottles = 0;
+  let unlockedReferralEarned = 0;
+  let quotaPendingReferralEarned = 0;
+
+  try {
+    // Find all downline users referred by this salesman
+    const { data: downlineUsers } = await supabase
+      .from('users')
+      .select('id, name, email')
+      .eq('referrer_id', salesman_id);
+
+    const downlineUserIds = (downlineUsers || []).map(u => u.id);
+
+    // Also include approved user_creation_requests
+    const { data: approvedReqs } = await supabase
+      .from('user_creation_requests')
+      .select('id, email, name')
+      .eq('requested_by', salesman_id)
+      .eq('status', 'approved');
+
+    (approvedReqs || []).forEach(r => {
+      if (r.id && UUID_REGEX.test(r.id) && !downlineUserIds.includes(r.id)) {
+        downlineUserIds.push(r.id);
+      }
+    });
+
+    const isQuotaActive = Boolean(user?.is_quota_condition_active);
+    const minQuota = Number(user?.min_sales_quota) || 0;
+    const isQualified = !isQuotaActive || minQuota === 0 || soldBottlesToday >= minQuota;
+
+    if (downlineUserIds.length > 0) {
+      const { data: downlineSales } = await supabase
+        .from('sales')
+        .select('quantity, product_id')
+        .in('salesman_id', downlineUserIds);
+
+      for (const ds of (downlineSales || [])) {
+        const q = Number(ds.quantity) || 0;
+        downlineBottles += q;
+        const p = await getProductWithMeta(ds.product_id);
+        const refRate = Number(p?.referral_commission) || 10.0;
+        const bonus = q * refRate;
+        if (isQualified) {
+          unlockedReferralEarned += bonus;
+        } else {
+          quotaPendingReferralEarned += bonus;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Downline earnings calculation warning:', err.message);
+  }
+
   const totalEarned = directCommissionEarned + unlockedReferralEarned;
 
   return res.json({
@@ -199,6 +238,8 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
     commission_earned: directCommissionEarned,
     downline_bottles_sold: downlineBottles,
     referral_earned: unlockedReferralEarned,
+    unlocked_referral_earned: unlockedReferralEarned,
+    quota_pending_referral_earned: quotaPendingReferralEarned,
     referral_bottles: downlineBottles,
     total_earned: totalEarned,
     monthly_earnings: totalEarned,
@@ -215,50 +256,110 @@ router.get('/api/salesman/referrals/:salesman_id', salesmanGeneralLimiter, async
   let list = [];
 
   try {
+    // 1. Fetch user creation requests submitted by this salesman
     const { data: dbRequests } = await supabase
       .from('user_creation_requests')
       .select('*')
       .eq('requested_by', salesman_id);
 
-    if (dbRequests && dbRequests.length > 0) {
-      list = dbRequests.map(r => ({
+    // 2. Fetch users directly registered or approved with referrer_id = salesman_id
+    const { data: dbUsers } = await supabase
+      .from('users')
+      .select('id, name, email, phone, status, kyc_status, aadhaar_doc, created_at')
+      .eq('referrer_id', salesman_id);
+
+    const userMap = new Map();
+    (dbUsers || []).forEach(u => {
+      userMap.set(u.id, u);
+      if (u.email) userMap.set(u.email.toLowerCase(), u);
+      if (u.name) userMap.set(u.name.toLowerCase(), u);
+    });
+
+    const processedEmails = new Set();
+
+    for (const r of (dbRequests || [])) {
+      const email = (r.email || '').toLowerCase();
+      if (email) processedEmails.add(email);
+      const linkedUser = userMap.get(r.id) || (email ? userMap.get(email) : null) || (r.name ? userMap.get(r.name.toLowerCase()) : null);
+
+      list.push({
         id: r.id,
+        user_id: linkedUser ? linkedUser.id : (UUID_REGEX.test(r.id) ? r.id : null),
         referrer_id: salesman_id,
-        referred_salesman_id: r.id,
+        referred_salesman_id: linkedUser ? linkedUser.id : r.id,
         full_name: r.name,
-        phone: r.phone || '',
-        status: r.status === 'approved' ? 'Active' : (r.status === 'rejected' ? 'Rejected' : 'Pending Approval'),
-        earned: 0,
-        bottles_sold: 0,
-        kyc_doc: r.kyc_doc || '',
-        kyc_status: r.status === 'approved' ? 'Verified' : 'Pending Review',
+        phone: r.phone || (linkedUser ? linkedUser.phone : '') || '',
+        status: (linkedUser || r.status === 'approved') ? 'Active' : (r.status === 'rejected' ? 'Rejected' : 'Pending Approval'),
+        kyc_doc: r.kyc_doc || (linkedUser ? linkedUser.aadhaar_doc : '') || '',
+        kyc_status: (linkedUser || r.status === 'approved') ? 'Verified' : 'Pending Review',
         created_at: r.created_at
-      }));
+      });
     }
+
+    // Add any users with referrer_id that were not in requests
+    for (const u of (dbUsers || [])) {
+      if (u.email && processedEmails.has(u.email.toLowerCase())) continue;
+      list.push({
+        id: u.id,
+        user_id: u.id,
+        referrer_id: salesman_id,
+        referred_salesman_id: u.id,
+        full_name: u.name,
+        phone: u.phone || '',
+        status: 'Active',
+        kyc_doc: u.aadhaar_doc || '',
+        kyc_status: u.kyc_status || 'Verified',
+        created_at: u.created_at
+      });
+    }
+
+    // Calculate bottles_sold and earned for each referral
+    const userIdsToQuery = list.map(ref => ref.user_id || ref.referred_salesman_id).filter(id => id && UUID_REGEX.test(id));
+
+    let salesByUser = {};
+    let earnedByUser = {};
+
+    if (userIdsToQuery.length > 0) {
+      const { data: salesData } = await supabase
+        .from('sales')
+        .select('salesman_id, quantity, product_id')
+        .in('salesman_id', userIdsToQuery);
+
+      for (const s of (salesData || [])) {
+        const q = Number(s.quantity) || 0;
+        salesByUser[s.salesman_id] = (salesByUser[s.salesman_id] || 0) + q;
+        const p = await getProductWithMeta(s.product_id);
+        const refRate = Number(p?.referral_commission) || 10.0;
+        earnedByUser[s.salesman_id] = (earnedByUser[s.salesman_id] || 0) + (q * refRate);
+      }
+    }
+
+    // Referrer qualification status
+    const { data: refUser } = await supabase.from('users').select('min_sales_quota, is_quota_condition_active').eq('id', salesman_id).maybeSingle();
+    const { data: mySales } = await supabase.from('sales').select('quantity').eq('salesman_id', salesman_id);
+    const mySalesToday = (mySales || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    const isQuotaActive = Boolean(refUser?.is_quota_condition_active);
+    const minQuota = Number(refUser?.min_sales_quota) || 0;
+    const isQualified = !isQuotaActive || minQuota === 0 || mySalesToday >= minQuota;
+
+    const enriched = list.map(ref => {
+      const uid = ref.user_id || ref.referred_salesman_id;
+      const bSold = salesByUser[uid] || 0;
+      const rawEarned = earnedByUser[uid] || 0;
+
+      return {
+        ...ref,
+        bottles_sold: bSold,
+        earned: isQualified ? rawEarned : 0,
+        pending_earned: isQualified ? 0 : rawEarned
+      };
+    });
+
+    return res.json(enriched);
   } catch (e) {
     console.warn('salesman referrals Supabase fetch warning:', e.message);
+    return res.json([]);
   }
-
-  const enriched = list.map(ref => {
-    const comms = runtimeCommissions.filter(
-      c => c.referrer_id === salesman_id && (c.seller_id === ref.referred_salesman_id || c.seller_name === ref.full_name)
-    );
-    const bottlesSold = comms.reduce((sum, c) => sum + (Number(c.bottles_sold) || 0), 0);
-    const commEarned = comms
-      .filter(c => c.status === 'unlocked' || c.status === 'paid')
-      .reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
-    const pendingComm = comms
-      .filter(c => c.status === 'quota_pending')
-      .reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
-
-    return {
-      ...ref,
-      bottles_sold: bottlesSold > 0 ? bottlesSold : (ref.bottles_sold || 0),
-      earned: commEarned > 0 ? commEarned : (ref.earned || 0),
-      pending_earned: pendingComm
-    };
-  });
-  return res.json(enriched);
 });
 
 router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, res) => {
