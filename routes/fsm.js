@@ -64,10 +64,14 @@ router.get('/api/fsm/dashboard/:fsm_id', fsmGeneralLimiter, async (req, res) => 
   let todayEarned = 0;
   let totalUnitsAllocated = 0;
   try {
-    const { data: dbComms } = await supabase.from('workforce_commissions').select('*').eq('user_id', fsmId);
-    if (dbComms && dbComms.length > 0) {
-      todayEarned = dbComms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
-      totalUnitsAllocated = dbComms.reduce((sum, c) => sum + (Number(c.quantity) || 0), 0);
+    const { data: completedDispatches } = await supabase.from('stock_transfers')
+      .select('quantity, product_id')
+      .eq('from_id', fsmId)
+      .eq('status', 'completed');
+
+    if (completedDispatches && completedDispatches.length > 0) {
+      totalUnitsAllocated = completedDispatches.reduce((sum, t) => sum + (Number(t.quantity) || 0), 0);
+      todayEarned = totalUnitsAllocated * 10;
     } else {
       const fsmComms = runtimeCommissions.filter(c => c.user_id === fsmId && c.role === 'field_sales_manager');
       todayEarned = fsmComms.reduce((sum, c) => sum + (Number(c.commission_amount) || 0), 0);
@@ -344,6 +348,7 @@ router.get('/api/fsm/settlement/:fsm_id', fsmGeneralLimiter, async (req, res) =>
   let totalReceived = 0;
   let totalSold = 0;
   let totalReturned = 0;
+  let teamSettlements = [];
 
   try {
     // 1. Fetch live pending settlements
@@ -365,11 +370,71 @@ router.get('/api/fsm/settlement/:fsm_id', fsmGeneralLimiter, async (req, res) =>
 
     // 4. Completed settlements
     const { data: completedSettlements } = await supabase.from('settlements').select('*').eq('fsm_id', fsm_id).eq('status', 'settled');
+    const settledMap = new Map();
     (completedSettlements || []).forEach(s => {
       totalSold += Number(s.bottles_sold) || 0;
       totalReturned += Number(s.remaining_qty) || 0;
+      if (s.salesman_id) settledMap.set(s.salesman_id, s);
     });
-  } catch (_) {}
+
+    // 5. Query supervised salesmen and their live sales & allocations
+    const { data: fsmUser } = await supabase.from('users').select('warehouse_id').eq('id', fsm_id).maybeSingle();
+    const { data: allSalesmen } = await supabase.from('users').select('*').eq('role', 'salesman');
+    const supervised = (allSalesmen || []).filter(u =>
+      u.parent_id === fsm_id ||
+      (fsmUser?.warehouse_id && u.warehouse_id === fsmUser.warehouse_id) ||
+      !u.parent_id
+    );
+
+    const smIds = supervised.map(u => u.id);
+    const smSalesMap = new Map();
+    let liveTeamSold = 0;
+
+    if (smIds.length > 0) {
+      const { data: salesList } = await supabase.from('sales').select('salesman_id, quantity, amount').in('salesman_id', smIds);
+      (salesList || []).forEach(s => {
+        const qty = Number(s.quantity) || 0;
+        const amt = Number(s.amount) || 0;
+        liveTeamSold += qty;
+        const prev = smSalesMap.get(s.salesman_id) || { qty: 0, amount: 0 };
+        smSalesMap.set(s.salesman_id, {
+          qty: prev.qty + qty,
+          amount: prev.amount + amt
+        });
+      });
+
+      const { data: smStocks } = await supabase.from('stocks').select('owner_id, quantity').in('owner_id', smIds);
+      const smStockMap = new Map();
+      (smStocks || []).forEach(st => {
+        smStockMap.set(st.owner_id, (smStockMap.get(st.owner_id) || 0) + (Number(st.quantity) || 0));
+      });
+
+      teamSettlements = supervised.map(sm => {
+        const smSales = smSalesMap.get(sm.id) || { qty: 0, amount: 0 };
+        const smStock = smStockMap.get(sm.id) || 0;
+        const isSettled = settledMap.has(sm.id);
+        const hasPendingSettlement = pendingSettlements.some(ps => ps.salesman_id === sm.id);
+
+        return {
+          id: sm.id,
+          salesman_id: sm.id,
+          name: sm.name || 'Salesman',
+          phone: sm.phone || '',
+          allocated: smStock + smSales.qty,
+          current_stock: smStock,
+          bottles_sold: smSales.qty,
+          pending_amount: smSales.amount,
+          status: isSettled ? 'settled' : hasPendingSettlement ? 'pending_review' : 'pending'
+        };
+      });
+    }
+
+    if (totalSold === 0 && liveTeamSold > 0) {
+      totalSold = liveTeamSold;
+    }
+  } catch (err) {
+    console.warn('Settlement Hub fetch error:', err.message);
+  }
 
   if (depotStock === 0) {
     depotStock = fsmSettlementHub.depot_stock || 0;
@@ -382,7 +447,7 @@ router.get('/api/fsm/settlement/:fsm_id', fsmGeneralLimiter, async (req, res) =>
   return res.json({
     depot_stock: depotStock,
     warehouse: {
-      received: totalReceived,
+      received: Math.max(totalReceived, depotStock + totalSold),
       sold: totalSold,
       returned: totalReturned,
       difference: 0,
@@ -390,7 +455,7 @@ router.get('/api/fsm/settlement/:fsm_id', fsmGeneralLimiter, async (req, res) =>
       sold_value: soldValue,
       status: depotStock > 0 ? 'pending_return' : 'settled'
     },
-    team_settlement: fsmSettlementHub.team_settlement || [],
+    team_settlement: teamSettlements.length > 0 ? teamSettlements : (fsmSettlementHub.team_settlement || []),
     pending_settlements: pendingSettlements
   });
 });
