@@ -165,6 +165,18 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
   }
 
   const soldBottlesToday = todaySales.reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+  let todayCashCollected = 0;
+  let todayOnlineCollected = 0;
+  todaySales.forEach(s => {
+    const amt = Number(s.amount) || 0;
+    const pm = (s.payment_method || '').toLowerCase();
+    if (pm === 'online' || pm === 'upi' || pm === 'card' || pm === 'bank' || pm === 'netbanking') {
+      todayOnlineCollected += amt;
+    } else {
+      todayCashCollected += amt;
+    }
+  });
+  const totalSalesRevenueToday = todayCashCollected + todayOnlineCollected;
 
   // Dynamic direct sale commissions from products sold
   let directCommissionEarned = 0;
@@ -235,6 +247,9 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
     salesman_name: user ? user.name : 'Salesman',
     is_on_duty: user ? (user.is_on_duty ?? true) : true,
     sold_bottles_today: soldBottlesToday,
+    cash_collected_today: todayCashCollected,
+    online_collected_today: todayOnlineCollected,
+    total_sales_revenue_today: totalSalesRevenueToday,
     commission_earned: directCommissionEarned,
     downline_bottles_sold: downlineBottles,
     referral_earned: unlockedReferralEarned,

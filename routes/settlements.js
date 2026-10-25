@@ -203,6 +203,26 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
     }
   } catch (_) {}
 
+  let soldBottlesToday = 0;
+  let cashCollectedToday = 0;
+  let onlineCollectedToday = 0;
+  try {
+    const { data: sales } = await supabase.from('sales').select('quantity, amount, payment_method').eq('salesman_id', salesman_id);
+    if (sales && sales.length > 0) {
+      sales.forEach(s => {
+        const qty = Number(s.quantity) || 0;
+        const amt = Number(s.amount) || 0;
+        soldBottlesToday += qty;
+        const pm = (s.payment_method || '').toLowerCase();
+        if (pm === 'online' || pm === 'upi' || pm === 'card' || pm === 'bank' || pm === 'netbanking') {
+          onlineCollectedToday += amt;
+        } else {
+          cashCollectedToday += amt;
+        }
+      });
+    }
+  } catch (_) {}
+
   const dynamicUnitPrice = await getDefaultProductUnitPrice();
   const todayDispatch = {
     date_label: 'Today',
@@ -210,12 +230,20 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
     bottles_dispatched: currentStock,
     unit_price: dynamicUnitPrice,
     total_value: currentStock * dynamicUnitPrice,
+    bottles_sold_today: soldBottlesToday,
+    cash_collected_today: cashCollectedToday,
+    online_collected_today: onlineCollectedToday,
+    total_revenue_today: cashCollectedToday + onlineCollectedToday,
     status: 'pending',
     verified: currentStock > 0
   };
 
   return res.json({
     today: todayDispatch,
+    bottles_sold_today: soldBottlesToday,
+    cash_collected_today: cashCollectedToday,
+    online_collected_today: onlineCollectedToday,
+    total_revenue_today: cashCollectedToday + onlineCollectedToday,
     history: settledHistory,
     pending_settlement: pendingSettlement
   });
