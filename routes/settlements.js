@@ -192,58 +192,114 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
   // Active pending settlement waiting for FSM scan (if any)
   const pendingSettlement = allSettlements.find(s => s.status === 'pending_fsm' || s.status === 'pending') || null;
 
-  let currentStock = 0;
-  try {
-    const { data: smStock } = await supabase.from('stocks').select('quantity').eq('owner_id', salesman_id).maybeSingle();
-    if (smStock) {
-      currentStock = Number(smStock.quantity) || 0;
-    } else {
-      const { data: user } = await supabase.from('users').select('current_stock').eq('id', salesman_id).maybeSingle();
-      if (user) currentStock = Number(user.current_stock) || 0;
-    }
-  } catch (_) {}
+  // Determine cutoff time of latest completed settlement
+  const latestSettled = settledHistory.length > 0 ? settledHistory[0] : null;
+  const latestSettledTime = latestSettled && latestSettled.created_at
+    ? new Date(latestSettled.created_at).getTime()
+    : 0;
 
-  let soldBottlesToday = 0;
-  let cashCollectedToday = 0;
-  let onlineCollectedToday = 0;
+  // Compute active stock held by salesman (dispatched after latest settlement)
+  let activeStock = 0;
   try {
-    const { data: sales } = await supabase.from('sales').select('quantity, amount, payment_method').eq('salesman_id', salesman_id);
-    if (sales && sales.length > 0) {
-      sales.forEach(s => {
-        const qty = Number(s.quantity) || 0;
-        const amt = Number(s.amount) || 0;
-        soldBottlesToday += qty;
-        const pm = (s.payment_method || '').toLowerCase();
-        if (pm === 'online' || pm === 'upi' || pm === 'card' || pm === 'bank' || pm === 'netbanking') {
-          onlineCollectedToday += amt;
-        } else {
-          cashCollectedToday += amt;
+    const { data: transfers } = await supabase.from('stock_transfers')
+      .select('quantity, created_at')
+      .eq('to_id', salesman_id)
+      .eq('status', 'completed');
+    if (transfers && transfers.length > 0) {
+      transfers.forEach(t => {
+        const transferTime = t.created_at ? new Date(t.created_at).getTime() : 0;
+        if (transferTime > latestSettledTime) {
+          activeStock += Number(t.quantity) || 0;
         }
       });
     }
   } catch (_) {}
 
+  // Cross-check with explicit stocks table if present
+  try {
+    const { data: smStock } = await supabase.from('stocks').select('quantity').eq('owner_id', salesman_id).maybeSingle();
+    if (smStock && smStock.quantity !== undefined) {
+      const explicitQty = Number(smStock.quantity) || 0;
+      if (explicitQty === 0 && latestSettled) {
+        activeStock = 0;
+      } else if (explicitQty > 0) {
+        activeStock = explicitQty;
+      }
+    }
+  } catch (_) {}
+
+  // Calculate total and unsettled sales
+  let totalSoldAllTime = 0;
+  let totalCashAllTime = 0;
+  let totalOnlineAllTime = 0;
+  let unsettledSold = 0;
+  let unsettledCash = 0;
+  let unsettledOnline = 0;
+
+  try {
+    const { data: sales } = await supabase.from('sales').select('quantity, amount, payment_method, created_at').eq('salesman_id', salesman_id);
+    if (sales && sales.length > 0) {
+      sales.forEach(s => {
+        const qty = Number(s.quantity) || 0;
+        const amt = Number(s.amount) || 0;
+        totalSoldAllTime += qty;
+        const pm = (s.payment_method || '').toLowerCase();
+        const isOnline = pm === 'online' || pm === 'upi' || pm === 'card' || pm === 'bank' || pm === 'netbanking';
+        if (isOnline) {
+          totalOnlineAllTime += amt;
+        } else {
+          totalCashAllTime += amt;
+        }
+
+        const saleTime = s.created_at ? new Date(s.created_at).getTime() : 0;
+        if (saleTime > latestSettledTime) {
+          unsettledSold += qty;
+          if (isOnline) unsettledOnline += amt;
+          else unsettledCash += amt;
+        }
+      });
+    }
+  } catch (_) {}
+
+  // Safety net: cumulative net calculation against all completed settlements
+  let totalSettledSold = 0;
+  let totalSettledCash = 0;
+  let totalSettledOnline = 0;
+  settledHistory.forEach(s => {
+    totalSettledSold += Number(s.bottles_sold) || 0;
+    totalSettledCash += Number(s.cash_received !== undefined ? s.cash_received : s.cash_collected || 0);
+    totalSettledOnline += Number(s.online_payment) || 0;
+  });
+
+  const netSold = Math.max(0, totalSoldAllTime - totalSettledSold);
+  const netCash = Math.max(0, totalCashAllTime - totalSettledCash);
+  const netOnline = Math.max(0, totalOnlineAllTime - totalSettledOnline);
+
+  const finalUnsettledSold = Math.min(unsettledSold, netSold);
+  const finalUnsettledCash = Math.min(unsettledCash, netCash);
+  const finalUnsettledOnline = Math.min(unsettledOnline, netOnline);
+
   const dynamicUnitPrice = await getDefaultProductUnitPrice();
   const todayDispatch = {
     date_label: 'Today',
     assigned_by: 'Field Sales Manager',
-    bottles_dispatched: currentStock,
+    bottles_dispatched: activeStock,
     unit_price: dynamicUnitPrice,
-    total_value: currentStock * dynamicUnitPrice,
-    bottles_sold_today: soldBottlesToday,
-    cash_collected_today: cashCollectedToday,
-    online_collected_today: onlineCollectedToday,
-    total_revenue_today: cashCollectedToday + onlineCollectedToday,
+    total_value: activeStock * dynamicUnitPrice,
+    bottles_sold_today: finalUnsettledSold,
+    cash_collected_today: finalUnsettledCash,
+    online_collected_today: finalUnsettledOnline,
+    total_revenue_today: finalUnsettledCash + finalUnsettledOnline,
     status: 'pending',
-    verified: currentStock > 0
+    verified: activeStock > 0
   };
 
   return res.json({
     today: todayDispatch,
-    bottles_sold_today: soldBottlesToday,
-    cash_collected_today: cashCollectedToday,
-    online_collected_today: onlineCollectedToday,
-    total_revenue_today: cashCollectedToday + onlineCollectedToday,
+    bottles_sold_today: finalUnsettledSold,
+    cash_collected_today: finalUnsettledCash,
+    online_collected_today: finalUnsettledOnline,
+    total_revenue_today: finalUnsettledCash + finalUnsettledOnline,
     history: settledHistory,
     pending_settlement: pendingSettlement
   });
