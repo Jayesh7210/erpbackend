@@ -177,15 +177,20 @@ router.put('/api/settlements/:id/accept', fsmOperationsLimiter, approveSettlemen
 router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, res) => {
   const { salesman_id } = req.params;
 
-  let list = [];
+  let allSettlements = [];
   try {
     const { data } = await supabase.from('settlements').select('*').eq('salesman_id', salesman_id).order('created_at', { ascending: false });
-    if (data && data.length > 0) list = data;
+    if (data && data.length > 0) allSettlements = data;
   } catch (_) {}
 
-  if (list.length === 0) {
-    list = runtimeSettlements.filter(s => s.salesman_id === salesman_id);
+  if (allSettlements.length === 0) {
+    allSettlements = runtimeSettlements.filter(s => s.salesman_id === salesman_id);
   }
+
+  // History should strictly only contain actual settled/completed settlements!
+  const settledHistory = allSettlements.filter(s => s.status === 'settled' || s.status === 'completed');
+  // Active pending settlement waiting for FSM scan (if any)
+  const pendingSettlement = allSettlements.find(s => s.status === 'pending_fsm' || s.status === 'pending') || null;
 
   let currentStock = 0;
   try {
@@ -211,8 +216,20 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
 
   return res.json({
     today: todayDispatch,
-    history: list
+    history: settledHistory,
+    pending_settlement: pendingSettlement
   });
+});
+
+// Cancel a pending settlement (before FSM has scanned it)
+router.delete('/api/settlement/:id', salesmanGeneralLimiter, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await supabase.from('settlements').delete().eq('id', id).eq('status', 'pending_fsm');
+  } catch (_) {}
+  const idx = runtimeSettlements.findIndex(s => s.id === id && s.status === 'pending_fsm');
+  if (idx !== -1) runtimeSettlements.splice(idx, 1);
+  return res.json({ success: true, message: 'Pending settlement cancelled successfully' });
 });
 
 // Record Settlement (Protected by Operations Limiter)
@@ -300,6 +317,18 @@ router.post('/api/settlements', fsmOperationsLimiter, async (req, res) => {
     security_pin: pin,
     created_at: new Date().toISOString()
   };
+
+  // Clear any existing un-scanned pending settlements for this salesman
+  try {
+    if (salesman_id && salesman_id.length > 20) {
+      await supabase.from('settlements').delete().eq('salesman_id', salesman_id).eq('status', 'pending_fsm');
+    }
+  } catch (_) {}
+  for (let i = runtimeSettlements.length - 1; i >= 0; i--) {
+    if (runtimeSettlements[i].salesman_id === salesman_id && runtimeSettlements[i].status === 'pending_fsm') {
+      runtimeSettlements.splice(i, 1);
+    }
+  }
 
   runtimeSettlements.unshift(settlement);
 

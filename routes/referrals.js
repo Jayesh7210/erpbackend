@@ -363,12 +363,14 @@ router.get('/api/salesman/referrals/:salesman_id', salesmanGeneralLimiter, async
 });
 
 router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, res) => {
-  const { referrer_id, full_name, phone, kyc_doc } = req.body;
+  const { referrer_id, full_name, phone, email, kyc_doc, doc_type } = req.body;
   if (!full_name || !phone) {
     return res.status(400).json({ error: 'Full name and phone number are required' });
   }
 
-  const generatedEmail = `${full_name.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Math.floor(100+Math.random()*900)}@erp.com`;
+  const generatedEmail = (email && email.trim().length > 0)
+    ? email.trim().toLowerCase()
+    : `${full_name.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Math.floor(100+Math.random()*900)}@erp.com`;
   const newReqId = `req_${Date.now()}`;
 
   // Dynamically resolve referrer's warehouse_id and parent_id
@@ -407,6 +409,8 @@ router.post('/api/salesman/referrals', salesmanOnboardingLimiter, async (req, re
     referred_salesman_id: newReqId,
     full_name,
     phone,
+    email: generatedEmail,
+    doc_type: doc_type || 'Aadhaar Card',
     status: 'Pending Approval',
     earned: 0,
     bottles_sold: 0,
