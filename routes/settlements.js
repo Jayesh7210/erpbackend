@@ -215,16 +215,12 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
     }
   } catch (_) {}
 
-  // Cross-check with explicit stocks table if present
+  // Fetch current remaining unsold stock held by salesman from stocks table
+  let currentRemainingStock = 0;
   try {
     const { data: smStock } = await supabase.from('stocks').select('quantity').eq('owner_id', salesman_id).maybeSingle();
     if (smStock && smStock.quantity !== undefined) {
-      const explicitQty = Number(smStock.quantity) || 0;
-      if (explicitQty === 0 && latestSettled) {
-        activeStock = 0;
-      } else if (explicitQty > 0) {
-        activeStock = explicitQty;
-      }
+      currentRemainingStock = Number(smStock.quantity) || 0;
     }
   } catch (_) {}
 
@@ -279,23 +275,33 @@ router.get('/api/settlements/:salesman_id', salesmanGeneralLimiter, async (req, 
   const finalUnsettledCash = Math.min(unsettledCash, netCash);
   const finalUnsettledOnline = Math.min(unsettledOnline, netOnline);
 
+  // Total stock allocated/dispatched is either total transfers received since last settlement,
+  // or (current unsold stock + unsettled sales)
+  let totalDispatched = activeStock;
+  if (totalDispatched === 0 || totalDispatched < (currentRemainingStock + finalUnsettledSold)) {
+    totalDispatched = currentRemainingStock + finalUnsettledSold;
+  }
+
   const dynamicUnitPrice = await getDefaultProductUnitPrice();
   const todayDispatch = {
     date_label: 'Today',
     assigned_by: 'Field Sales Manager',
-    bottles_dispatched: activeStock,
+    bottles_dispatched: totalDispatched,
+    current_stock: currentRemainingStock,
     unit_price: dynamicUnitPrice,
-    total_value: activeStock * dynamicUnitPrice,
+    total_value: totalDispatched * dynamicUnitPrice,
     bottles_sold_today: finalUnsettledSold,
     cash_collected_today: finalUnsettledCash,
     online_collected_today: finalUnsettledOnline,
     total_revenue_today: finalUnsettledCash + finalUnsettledOnline,
     status: 'pending',
-    verified: activeStock > 0
+    verified: totalDispatched > 0
   };
 
   return res.json({
     today: todayDispatch,
+    bottles_dispatched: totalDispatched,
+    current_stock: currentRemainingStock,
     bottles_sold_today: finalUnsettledSold,
     cash_collected_today: finalUnsettledCash,
     online_collected_today: finalUnsettledOnline,
