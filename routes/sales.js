@@ -44,31 +44,33 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
     const initialQuota = Number(product.initial_stock_quota) || 0;
     const slabs = Array.isArray(product.commission_slabs) ? product.commission_slabs : [];
 
-    // Calculate prior units sold by this salesman for this product
+    // Calculate prior units sold by this salesman for this product (before this sale)
     let priorSalesQty = 0;
     try {
       const { data: pastSales } = await supabase.from('sales')
         .select('quantity')
         .eq('salesman_id', seller.id)
         .eq('product_id', product.id);
-      priorSalesQty = (pastSales || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+      const totalPastSales = (pastSales || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+      priorSalesQty = Math.max(0, totalPastSales - saleQty);
     } catch (_) {}
 
     const rtSalesCount = runtimeSales
       .filter(s => s.salesman_id === seller.id && s.product_id === product.id)
       .reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
-    if (rtSalesCount > priorSalesQty) priorSalesQty = rtSalesCount;
+    const rtPrior = Math.max(0, rtSalesCount - saleQty);
+    if (rtPrior > priorSalesQty) priorSalesQty = rtPrior;
 
     // Calculate commission dynamically across saleQty units with slab bonus
     let directAmount = 0.0;
     for (let i = 1; i <= saleQty; i++) {
       const unitNumber = priorSalesQty + i;
       let unitRate = baseDirectRate;
-      if (slabs.length > 0 && unitNumber > initialQuota) {
+      if (slabs.length > 0) {
         const matchingSlab = slabs.find(s => {
           const from = Number(s.from_qty) || 0;
           const to = Number(s.to_qty) || 0;
-          return unitNumber >= from && (to === 0 || unitNumber <= to);
+          return unitNumber >= from && (to === 0 || unitNumber <= to) && (initialQuota === 0 || unitNumber > initialQuota || from > initialQuota);
         });
         if (matchingSlab) {
           unitRate += (Number(matchingSlab.added_commission) || 0.0);
@@ -421,4 +423,5 @@ router.get('/api/sales/report', storeAdminGeneralLimiter, async (req, res) => {
   }
 });
 
+router.runtimeSales = runtimeSales;
 module.exports = router;

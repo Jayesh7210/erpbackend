@@ -164,6 +164,18 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
     console.warn('salesman earnings Supabase query warning:', e.message);
   }
 
+  // Merge runtimeSales if present
+  try {
+    const salesModule = require('./sales');
+    const runtimeSales = salesModule.runtimeSales || [];
+    const existingIds = new Set(todaySales.map(s => s.id));
+    for (const rs of runtimeSales) {
+      if (rs.salesman_id === salesman_id && !existingIds.has(rs.id)) {
+        todaySales.push(rs);
+      }
+    }
+  } catch (_) {}
+
   const soldBottlesToday = todaySales.reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
   let todayCashCollected = 0;
   let todayOnlineCollected = 0;
@@ -178,12 +190,46 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
   });
   const totalSalesRevenueToday = todayCashCollected + todayOnlineCollected;
 
-  // Dynamic direct sale commissions from products sold
+  // Dynamic direct sale commissions from products sold with over-stock surge slabs
   let directCommissionEarned = 0;
+  let baseCommissionEarned = 0;
+  let slabBonusEarned = 0;
+
+  // Group sales by product to accurately apply product-specific surge slabs
+  const salesByProduct = {};
   for (const s of todaySales) {
-    const prod = await getProductWithMeta(s.product_id);
-    const rate = Number(prod?.salesman_commission) || 50.0;
-    directCommissionEarned += (Number(s.quantity) || 0) * rate;
+    const pid = s.product_id || 'default';
+    if (!salesByProduct[pid]) salesByProduct[pid] = [];
+    salesByProduct[pid].push(s);
+  }
+
+  for (const pid of Object.keys(salesByProduct)) {
+    const prod = await getProductWithMeta(pid);
+    const baseDirectRate = Number(prod?.salesman_commission) || 50.0;
+    const initialQuota = Number(prod?.initial_stock_quota) || 0;
+    const slabs = Array.isArray(prod?.commission_slabs) ? prod.commission_slabs : [];
+
+    const pSales = salesByProduct[pid];
+    const totalProdQty = pSales.reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+
+    for (let u = 1; u <= totalProdQty; u++) {
+      let unitRate = baseDirectRate;
+      let addedRate = 0.0;
+      if (slabs.length > 0) {
+        const matchingSlab = slabs.find(sl => {
+          const from = Number(sl.from_qty) || 0;
+          const to = Number(sl.to_qty) || 0;
+          return u >= from && (to === 0 || u <= to) && (initialQuota === 0 || u > initialQuota || from > initialQuota);
+        });
+        if (matchingSlab) {
+          addedRate = Number(matchingSlab.added_commission) || 0.0;
+          unitRate += addedRate;
+        }
+      }
+      baseCommissionEarned += baseDirectRate;
+      slabBonusEarned += addedRate;
+      directCommissionEarned += unitRate;
+    }
   }
 
   // Dynamic referral commissions from direct downline referrals (Strictly 1-Level)
@@ -251,6 +297,8 @@ router.get('/api/salesman/earnings/:salesman_id', salesmanGeneralLimiter, async 
     online_collected_today: todayOnlineCollected,
     total_sales_revenue_today: totalSalesRevenueToday,
     commission_earned: directCommissionEarned,
+    base_commission_earned: baseCommissionEarned,
+    slab_bonus_earned: slabBonusEarned,
     downline_bottles_sold: downlineBottles,
     referral_earned: unlockedReferralEarned,
     unlocked_referral_earned: unlockedReferralEarned,
