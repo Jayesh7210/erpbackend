@@ -111,5 +111,37 @@
         "label": "Tier 2 (+₹10)"
       }
     ]
+  },
+  "b1a8d444-c3c3-4c63-82ba-84913b37a4bf": {
+    "is_active": true,
+    "category": "General",
+    "base_price": 300,
+    "min_stock_alert": 20,
+    "image_url": null,
+    "store_admin_commission": 5,
+    "fsm_commission": 10,
+    "salesman_commission": 50,
+    "referral_commission": 10,
+    "initial_stock_quota": 100,
+    "commission_slabs": [
+      {
+        "from_qty": 100,
+        "to_qty": 150,
+        "added_commission": 5,
+        "label": "Tier 1 (+₹5)"
+      },
+      {
+        "from_qty": 151,
+        "to_qty": 200,
+        "added_commission": 10,
+        "label": "Tier 2 (+₹10)"
+      },
+      {
+        "from_qty": 201,
+        "to_qty": 999,
+        "added_commission": 15,
+        "label": "Tier 3 (+₹15)"
+      }
+    ]
   }
 }

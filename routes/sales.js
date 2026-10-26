@@ -38,10 +38,47 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
 
   const product = await getProductWithMeta(product_id);
 
-  // 1. Direct Commission for Salesman (selling to customer)
+  // 1. Direct Commission for Salesman (selling to customer) with dynamic over-stock slabs
   if (seller && product) {
-    const directRate = Number(product.salesman_commission) || 0.0;
-    const directAmount = saleQty * directRate;
+    const baseDirectRate = Number(product.salesman_commission) || 0.0;
+    const initialQuota = Number(product.initial_stock_quota) || 0;
+    const slabs = Array.isArray(product.commission_slabs) ? product.commission_slabs : [];
+
+    // Calculate prior units sold by this salesman for this product
+    let priorSalesQty = 0;
+    try {
+      const { data: pastSales } = await supabase.from('sales')
+        .select('quantity')
+        .eq('salesman_id', seller.id)
+        .eq('product_id', product.id);
+      priorSalesQty = (pastSales || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    } catch (_) {}
+
+    const rtSalesCount = runtimeSales
+      .filter(s => s.salesman_id === seller.id && s.product_id === product.id)
+      .reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    if (rtSalesCount > priorSalesQty) priorSalesQty = rtSalesCount;
+
+    // Calculate commission dynamically across saleQty units with slab bonus
+    let directAmount = 0.0;
+    for (let i = 1; i <= saleQty; i++) {
+      const unitNumber = priorSalesQty + i;
+      let unitRate = baseDirectRate;
+      if (slabs.length > 0 && unitNumber > initialQuota) {
+        const matchingSlab = slabs.find(s => {
+          const from = Number(s.from_qty) || 0;
+          const to = Number(s.to_qty) || 0;
+          return unitNumber >= from && (to === 0 || unitNumber <= to);
+        });
+        if (matchingSlab) {
+          unitRate += (Number(matchingSlab.added_commission) || 0.0);
+        }
+      }
+      directAmount += unitRate;
+    }
+
+    const effectiveRate = saleQty > 0 ? (directAmount / saleQty) : baseDirectRate;
+
     if (directAmount > 0) {
       const directComm = {
         id: `dir_comm_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`,
@@ -53,8 +90,8 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
         product_id: product.id,
         product_name: product.name,
         bottles_sold: saleQty,
-        rate_per_bottle: directRate,
-        commission_amount: directAmount,
+        rate_per_bottle: Number(effectiveRate.toFixed(2)),
+        commission_amount: Number(directAmount.toFixed(2)),
         status: 'unlocked',
         created_at: new Date().toISOString()
       };
@@ -66,8 +103,8 @@ async function processWorkforceCommissionForSale(salesman_id, saleQty, saleId, p
           seller_name: seller.name,
           sale_id: saleId || null,
           bottles_sold: saleQty,
-          rate_per_bottle: directRate,
-          commission_amount: directAmount,
+          rate_per_bottle: Number(effectiveRate.toFixed(2)),
+          commission_amount: Number(directAmount.toFixed(2)),
           status: 'unlocked'
         }]);
       } catch (_) {}

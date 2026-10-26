@@ -50,14 +50,15 @@ router.get('/api/workforce', superAdminGeneralLimiter, async (req, res) => {
 
 // Create user directly (Protected by Sensitive Admin Rate Limiter)
 router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
-  const { name, email, phone, role, warehouse_id, parent_id, password, aadhaar_number, aadhaar_doc, admin_id, admin_name } = req.body;
+  const { name, email, phone, role, warehouse_id, parent_id, password, aadhaar_number, aadhaar_doc, kyc_doc, doc_type, id_number, admin_id, admin_name } = req.body;
   if (!name || !email || !role) {
     return res.status(400).json({ error: 'Name, email, and role are required' });
   }
 
   const assignedPassword = (password || '').trim() || (role === 'store_admin' ? 'store123' : role === 'field_sales_manager' ? 'fsm123' : 'sales123');
-  const aadhNumber = (aadhaar_number || '').trim();
-  const aadhDoc = (aadhaar_doc || '').trim();
+  const aadhNumber = (id_number || aadhaar_number || '').trim();
+  const aadhDoc = (kyc_doc || aadhaar_doc || '').trim();
+  const documentType = (doc_type || 'Aadhaar Card').trim();
 
   try {
     const userPayload = {
@@ -72,6 +73,7 @@ router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
     if (assignedPassword) userPayload.password = assignedPassword;
     if (aadhNumber) userPayload.aadhaar_number = aadhNumber;
     if (aadhDoc) userPayload.aadhaar_doc = aadhDoc;
+    if (documentType) userPayload.doc_type = documentType;
 
     let insertedData = null;
     try {
@@ -79,11 +81,19 @@ router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
       if (error) throw error;
       insertedData = data;
     } catch (_) {
-      const { data, error: fbErr } = await supabase.from('users').insert([{
-        name, email, role, warehouse_id: warehouse_id || null, parent_id: parent_id || null, status: 'approved'
-      }]).select().single();
-      if (fbErr) throw fbErr;
-      insertedData = data;
+      try {
+        const fallbackPayload = { ...userPayload };
+        delete fallbackPayload.doc_type;
+        const { data, error: dtErr } = await supabase.from('users').insert([fallbackPayload]).select().single();
+        if (dtErr) throw dtErr;
+        insertedData = data;
+      } catch (__) {
+        const { data, error: fbErr } = await supabase.from('users').insert([{
+          name, email, role, warehouse_id: warehouse_id || null, parent_id: parent_id || null, status: 'approved'
+        }]).select().single();
+        if (fbErr) throw fbErr;
+        insertedData = data;
+      }
     }
 
     if (role === 'customer' || role === 'distributor') {
@@ -101,7 +111,8 @@ router.post('/api/users', superAdminSensitiveLimiter, async (req, res) => {
       phone: phone || '',
       password: assignedPassword,
       aadhaar_number: aadhNumber,
-      aadhaar_doc: aadhDoc
+      aadhaar_doc: aadhDoc,
+      doc_type: documentType
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -138,7 +149,7 @@ router.post('/api/users/:id/reset-password', superAdminSensitiveLimiter, async (
 // Update user details (Protected by General Admin Rate Limiter)
 router.put('/api/users/:id', superAdminGeneralLimiter, async (req, res) => {
   const { id } = req.params;
-  const { name, email, phone, role, warehouse_id, parent_id, status, password, aadhaar_number, aadhaar_doc, admin_id, admin_name } = req.body;
+  const { name, email, phone, role, warehouse_id, parent_id, status, password, aadhaar_number, aadhaar_doc, kyc_doc, doc_type, id_number, admin_id, admin_name } = req.body;
 
   try {
     const updateData = {};
@@ -150,15 +161,33 @@ router.put('/api/users/:id', superAdminGeneralLimiter, async (req, res) => {
     if (parent_id !== undefined) updateData.parent_id = parent_id;
     if (status !== undefined) updateData.status = status;
     if (password !== undefined && password.trim().length > 0) updateData.password = password.trim();
-    if (aadhaar_number !== undefined) updateData.aadhaar_number = aadhaar_number;
-    if (aadhaar_doc !== undefined) updateData.aadhaar_doc = aadhaar_doc;
+    if (id_number !== undefined || aadhaar_number !== undefined) updateData.aadhaar_number = (id_number !== undefined ? id_number : aadhaar_number);
+    if (kyc_doc !== undefined || aadhaar_doc !== undefined) updateData.aadhaar_doc = (kyc_doc !== undefined ? kyc_doc : aadhaar_doc);
+    if (doc_type !== undefined) updateData.doc_type = doc_type;
 
-    const { data, error } = await supabase.from('users')
-      .update(updateData)
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) throw error;
+    let data;
+    try {
+      const resData = await supabase.from('users')
+        .update(updateData)
+        .eq('id', id)
+        .select()
+        .single();
+      if (resData.error) throw resData.error;
+      data = resData.data;
+    } catch (err) {
+      if (updateData.doc_type) {
+        delete updateData.doc_type;
+        const res2 = await supabase.from('users')
+          .update(updateData)
+          .eq('id', id)
+          .select()
+          .single();
+        if (res2.error) throw res2.error;
+        data = res2.data;
+      } else {
+        throw err;
+      }
+    }
 
     await logAudit(admin_id, admin_name, 'UPDATE_USER', 'users', id, `Updated user ${data.name}: ${JSON.stringify(updateData)}`);
     return res.json(data);
