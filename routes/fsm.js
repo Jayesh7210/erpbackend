@@ -4,7 +4,7 @@ const { supabaseAdmin: supabase } = require('../db');
 const { logAudit } = require('../services/audit');
 const { getDefaultProductUnitPrice } = require('../services/productMeta');
 const { runtimeCommissions } = require('../services/commissionService');
-const { fsmSettlementHub } = require('../services/settlementService');
+const { fsmSettlementHub, runtimeWarehouseReturns } = require('../services/settlementService');
 const { fsmGeneralLimiter, fsmOperationsLimiter, fsmReminderLimiter } = require('../services/rateLimiter');
 
 // ==========================================
@@ -462,23 +462,85 @@ router.get('/api/fsm/settlement/:fsm_id', fsmGeneralLimiter, async (req, res) =>
 
 // 7. Warehouse Return QR Generation (Protected by FSM Reminder & QR Limiter)
 router.post('/api/fsm/warehouse-return-qr', fsmReminderLimiter, async (req, res) => {
-  const { fsm_id, quantity } = req.body || {};
-  const returnQty = Number(quantity) || 0;
+  const { fsm_id, quantity, warehouse_id } = req.body || {};
+  let returnQty = Number(quantity) || 0;
+
+  // Auto-detect available depot stock if returnQty was passed as 0
+  if (returnQty <= 0 && fsm_id) {
+    try {
+      const { data: stks } = await supabase.from('stocks').select('quantity').eq('owner_id', fsm_id);
+      returnQty = (stks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    } catch (_) {}
+    if (returnQty <= 0) returnQty = fsmSettlementHub.depot_stock || 0;
+  }
+
+  let fsmName = 'Field Sales Manager';
+  let targetWarehouseId = warehouse_id;
+
+  try {
+    if (fsm_id) {
+      const { data: u } = await supabase.from('users').select('name, warehouse_id').eq('id', fsm_id).maybeSingle();
+      if (u) {
+        if (u.name) fsmName = u.name;
+        if (!targetWarehouseId && u.warehouse_id) targetWarehouseId = u.warehouse_id;
+      }
+    }
+  } catch (_) {}
+
+  if (!targetWarehouseId) {
+    try {
+      const { data: firstWh } = await supabase.from('warehouses').select('id').limit(1).maybeSingle();
+      if (firstWh) targetWarehouseId = firstWh.id;
+    } catch (_) {}
+  }
+
   const token = `WR-RET-${Math.floor(10000 + Math.random() * 90000)}`;
+  const securityPin = `${Math.floor(100000 + Math.random() * 900000)}`;
   const defaultUnitPrice = await getDefaultProductUnitPrice();
-  const result = {
+
+  // Clear previous pending return records for this FSM
+  if (fsm_id) {
+    for (let i = runtimeWarehouseReturns.length - 1; i >= 0; i--) {
+      if (runtimeWarehouseReturns[i].fsm_id === fsm_id && runtimeWarehouseReturns[i].status === 'pending_warehouse') {
+        runtimeWarehouseReturns.splice(i, 1);
+      }
+    }
+  }
+
+  const returnRecord = {
+    id: `fsm_ret_${Date.now()}`,
     qr_token: token,
     return_code: token,
+    security_pin: securityPin,
     fsm_id: fsm_id || null,
+    fsm_name: fsmName,
+    warehouse_id: targetWarehouseId || null,
     quantity: returnQty,
     inventory_value: returnQty * defaultUnitPrice,
-    status: 'authorized',
+    status: 'pending_warehouse',
+    qr_payload: JSON.stringify({
+      type: 'FSM_WAREHOUSE_RETURN',
+      return_code: token,
+      security_pin: securityPin,
+      fsm_id: fsm_id || null,
+      fsm_name: fsmName,
+      quantity: returnQty,
+      warehouse_id: targetWarehouseId
+    }),
     expires_at: new Date(Date.now() + 86400000).toISOString(),
     created_at: new Date().toISOString()
   };
-  await logAudit(fsm_id || 'system', 'Field Manager', 'GENERATE_RETURN_QR', 'settlements', token, `Generated return QR for ${returnQty} bottles`);
-  return res.json(result);
+
+  runtimeWarehouseReturns.unshift(returnRecord);
+
+  if (fsmSettlementHub && fsmSettlementHub.warehouse) {
+    fsmSettlementHub.warehouse.status = 'pending_warehouse';
+  }
+
+  await logAudit(fsm_id || 'system', 'Field Manager', 'GENERATE_RETURN_QR', 'settlements', token, `Generated warehouse return QR ${token} (PIN: ${securityPin}) for ${returnQty} bottles`);
+  return res.json(returnRecord);
 });
+
 
 // 8. Settlement Reminder to Pending Salesman (Protected by FSM Reminder Limiter)
 router.post('/api/fsm/settlement-remind/:salesman_id', fsmReminderLimiter, async (req, res) => {

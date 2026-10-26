@@ -1,5 +1,6 @@
 // Runtime settlement and FSM hub store
 const runtimeSettlements = [];
+const runtimeWarehouseReturns = [];
 
 const fsmSettlementHub = {
   depot_stock: 0,
@@ -15,5 +16,7 @@ const fsmSettlementHub = {
 
 module.exports = {
   runtimeSettlements,
+  runtimeWarehouseReturns,
   fsmSettlementHub
 };
+

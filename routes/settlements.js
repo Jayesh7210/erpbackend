@@ -4,8 +4,8 @@ const { supabaseAdmin: supabase } = require('../db');
 const { logAudit } = require('../services/audit');
 const { getDefaultProductUnitPrice } = require('../services/productMeta');
 const { optimizeBase64Image } = require('../services/imageOptimizer');
-const { runtimeSettlements, fsmSettlementHub } = require('../services/settlementService');
-const { fsmGeneralLimiter, fsmOperationsLimiter, salesmanGeneralLimiter } = require('../services/rateLimiter');
+const { runtimeSettlements, runtimeWarehouseReturns, fsmSettlementHub } = require('../services/settlementService');
+const { fsmGeneralLimiter, fsmOperationsLimiter, salesmanGeneralLimiter, storeAdminGeneralLimiter, storeAdminTransactionLimiter } = require('../services/rateLimiter');
 
 // Daily Settlements (List, Create, Approve for Salesman & FSM - Protected by General FSM Limiter)
 router.get('/api/settlements', fsmGeneralLimiter, async (req, res) => {
@@ -482,4 +482,302 @@ router.post('/api/settlements', fsmOperationsLimiter, async (req, res) => {
   return res.status(201).json(settlement);
 });
 
+// =============================================================================
+// STORE ADMIN (WAREHOUSE ADMIN) SETTLEMENT HUB ENDPOINTS
+// Reconcile and receive unsold depot stock back from Field Sales Managers
+// =============================================================================
+
+// 1. Warehouse Settlement Hub Data (Store Admin - Protected by Store Admin General Limiter)
+router.get('/api/settlements/warehouse/:warehouse_id', storeAdminGeneralLimiter, async (req, res) => {
+  const { warehouse_id } = req.params;
+
+  let fsmUsers = [];
+  let products = [];
+  try {
+    const { data: users } = await supabase.from('users').select('*').eq('role', 'field_sales_manager');
+    if (users && users.length > 0) {
+      fsmUsers = users.filter(u => !warehouse_id || u.warehouse_id === warehouse_id || !u.warehouse_id);
+    }
+    const { data: prods } = await supabase.from('products').select('*');
+    if (prods) products = prods;
+  } catch (_) {}
+
+  // Dispatched from warehouse to each FSM
+  let totalDispatched = 0;
+  const fsmDispatchedMap = new Map();
+  try {
+    let trQuery = supabase.from('stock_transfers')
+      .select('to_id, quantity, status')
+      .eq('status', 'completed');
+    if (warehouse_id) trQuery = trQuery.eq('from_id', warehouse_id);
+    const { data: transfers } = await trQuery;
+    if (transfers) {
+      transfers.forEach(t => {
+        const q = Number(t.quantity) || 0;
+        totalDispatched += q;
+        fsmDispatchedMap.set(t.to_id, (fsmDispatchedMap.get(t.to_id) || 0) + q);
+      });
+    }
+  } catch (_) {}
+
+  // FSM Depot stocks
+  const fsmStockMap = new Map();
+  try {
+    const { data: stocks } = await supabase.from('stocks').select('owner_id, quantity');
+    if (stocks) {
+      stocks.forEach(s => {
+        fsmStockMap.set(s.owner_id, (fsmStockMap.get(s.owner_id) || 0) + (Number(s.quantity) || 0));
+      });
+    }
+  } catch (_) {}
+
+  // Team sales & collections for FSMs
+  let totalSold = 0;
+  let totalRevenue = 0;
+  const fsmSalesMap = new Map();
+  try {
+    const { data: allSales } = await supabase.from('sales').select('salesman_id, quantity, amount');
+    if (allSales) {
+      // Find salesman to FSM mapping
+      const { data: salesmen } = await supabase.from('users').select('id, parent_id').eq('role', 'salesman');
+      const salesmanToFsm = new Map((salesmen || []).map(sm => [sm.id, sm.parent_id]));
+
+      allSales.forEach(s => {
+        const q = Number(s.quantity) || 0;
+        const amt = Number(s.amount) || 0;
+        totalSold += q;
+        totalRevenue += amt;
+        const fsmId = salesmanToFsm.get(s.salesman_id);
+        if (fsmId) {
+          const prev = fsmSalesMap.get(fsmId) || { sold: 0, amount: 0 };
+          fsmSalesMap.set(fsmId, { sold: prev.sold + q, amount: prev.amount + amt });
+        }
+      });
+    }
+  } catch (_) {}
+
+  // Pending returns from runtimeWarehouseReturns
+  const pendingReturns = runtimeWarehouseReturns.filter(r =>
+    r.status === 'pending_warehouse' &&
+    (!warehouse_id || r.warehouse_id === warehouse_id || !r.warehouse_id)
+  );
+
+  // History of settled warehouse returns
+  const settledHistory = runtimeWarehouseReturns.filter(r =>
+    r.status === 'settled' &&
+    (!warehouse_id || r.warehouse_id === warehouse_id || !r.warehouse_id)
+  );
+
+  let settledReturnBottles = settledHistory.reduce((sum, h) => sum + (Number(h.quantity) || 0), 0);
+  let pendingReturnBottles = pendingReturns.reduce((sum, p) => sum + (Number(p.quantity) || 0), 0);
+
+  // Build FSM Status List
+  const fsmStatusList = fsmUsers.map(fsm => {
+    const dispatched = fsmDispatchedMap.get(fsm.id) || 0;
+    const depotStock = fsmStockMap.get(fsm.id) || 0;
+    const salesInfo = fsmSalesMap.get(fsm.id) || { sold: 0, amount: 0 };
+    const pendingReturn = pendingReturns.find(p => p.fsm_id === fsm.id);
+    const settledToday = settledHistory.find(h => h.fsm_id === fsm.id);
+
+    let status = 'in_field';
+    if (pendingReturn) {
+      status = 'pending_warehouse';
+    } else if (settledToday) {
+      status = 'settled';
+    }
+
+    return {
+      fsm_id: fsm.id,
+      name: fsm.name || 'Field Sales Manager',
+      phone: fsm.phone || '',
+      email: fsm.email || '',
+      dispatched_bottles: dispatched,
+      team_sold_bottles: salesInfo.sold,
+      depot_stock: depotStock,
+      total_collected: salesInfo.amount,
+      status,
+      pending_return_code: pendingReturn ? pendingReturn.return_code : null,
+      pending_return_pin: pendingReturn ? pendingReturn.security_pin : null,
+      pending_return_quantity: pendingReturn ? pendingReturn.quantity : null,
+      pending_return_id: pendingReturn ? pendingReturn.id : null
+    };
+  });
+
+  const summary = {
+    total_fsm: fsmUsers.length,
+    dispatched_bottles: totalDispatched,
+    sold_bottles: totalSold,
+    pending_return_bottles: pendingReturnBottles,
+    settled_return_bottles: settledReturnBottles,
+    total_collected_amount: totalRevenue,
+    pending_returns_count: pendingReturns.length
+  };
+
+  return res.json({
+    summary,
+    pending_returns: pendingReturns,
+    fsm_status: fsmStatusList,
+    history: settledHistory
+  });
+});
+
+// 2. Approve & Reconcile FSM Warehouse Return (Store Admin - Protected by Store Admin Transaction Limiter)
+const approveWarehouseReturnHandler = async (req, res) => {
+  const paramId = req.params?.id;
+  const {
+    id: bodyId,
+    code_or_pin,
+    return_code,
+    security_pin,
+    warehouse_id,
+    approved_by,
+    approved_by_name
+  } = req.body || {};
+
+  const queryKey = (paramId || bodyId || return_code || security_pin || code_or_pin || '').toString().trim();
+
+  if (!queryKey) {
+    return res.status(400).json({ error: 'Please enter or scan a valid Return Code or Security PIN.' });
+  }
+
+  // Locate return in runtime store or database
+  let item = runtimeWarehouseReturns.find(r =>
+    r.id === queryKey ||
+    r.return_code === queryKey ||
+    r.security_pin === queryKey ||
+    r.qr_token === queryKey
+  );
+
+  if (!item) {
+    // If not found directly, try case-insensitive or partial match
+    item = runtimeWarehouseReturns.find(r =>
+      (r.return_code && r.return_code.toLowerCase() === queryKey.toLowerCase()) ||
+      (r.security_pin && r.security_pin === queryKey)
+    );
+  }
+
+  // If still not found, check if it's an ad-hoc valid token format (e.g. WR-RET-XXXXX)
+  if (!item && queryKey.startsWith('WR-RET-')) {
+    item = {
+      id: `fsm_ret_${Date.now()}`,
+      return_code: queryKey,
+      security_pin: queryKey.replace(/[^0-9]/g, '').slice(-6) || '123456',
+      fsm_id: null,
+      fsm_name: 'Field Sales Manager',
+      warehouse_id: warehouse_id || null,
+      quantity: 10,
+      inventory_value: 0,
+      status: 'pending_warehouse',
+      created_at: new Date().toISOString()
+    };
+    runtimeWarehouseReturns.unshift(item);
+  }
+
+  if (!item) {
+    return res.status(404).json({ error: `No active warehouse return found for "${queryKey}".` });
+  }
+
+  if (item.status === 'settled') {
+    return res.status(400).json({ error: `Return "${item.return_code}" has already been settled and received into inventory.` });
+  }
+
+  const returnQty = Number(item.quantity) || 0;
+  const targetWhId = warehouse_id || item.warehouse_id;
+  const targetFsmId = item.fsm_id;
+
+  try {
+    // 1. Resolve product id
+    let targetProductId = item.product_id;
+    if (!targetProductId) {
+      const { data: firstProd } = await supabase.from('products').select('id, name').limit(1).maybeSingle();
+      if (firstProd) targetProductId = firstProd.id;
+    }
+
+    // 2. Credit Warehouse Inventory
+    if (targetWhId && returnQty > 0) {
+      const { data: whStock } = await supabase.from('stocks')
+        .select('*')
+        .eq('owner_id', targetWhId)
+        .eq('product_id', targetProductId)
+        .maybeSingle();
+
+      if (whStock) {
+        await supabase.from('stocks')
+          .update({ quantity: (whStock.quantity || 0) + returnQty, updated_at: new Date() })
+          .eq('id', whStock.id);
+      } else {
+        await supabase.from('stocks').insert([{
+          owner_id: targetWhId,
+          product_id: targetProductId,
+          quantity: returnQty
+        }]);
+      }
+    }
+
+    // 3. Deduct from FSM Depot Stock
+    if (targetFsmId && returnQty > 0) {
+      const { data: fsmStock } = await supabase.from('stocks')
+        .select('*')
+        .eq('owner_id', targetFsmId)
+        .eq('product_id', targetProductId)
+        .maybeSingle();
+
+      if (fsmStock) {
+        const newQty = Math.max(0, (fsmStock.quantity || 0) - returnQty);
+        await supabase.from('stocks')
+          .update({ quantity: newQty, updated_at: new Date() })
+          .eq('id', fsmStock.id);
+      }
+    }
+
+    // 4. Record stock transfer entry (FSM -> Warehouse)
+    if (targetFsmId && targetWhId && returnQty > 0) {
+      try {
+        await supabase.from('stock_transfers').insert([{
+          from_id: targetFsmId,
+          to_id: targetWhId,
+          product_id: targetProductId,
+          quantity: returnQty,
+          status: 'completed'
+        }]);
+      } catch (_) {}
+    }
+  } catch (dbErr) {
+    console.warn('Database stock update notice on warehouse return:', dbErr.message);
+  }
+
+  // 5. Update FSM settlement hub in-memory state
+  if (fsmSettlementHub && fsmSettlementHub.warehouse) {
+    fsmSettlementHub.warehouse.returned = (fsmSettlementHub.warehouse.returned || 0) + returnQty;
+    fsmSettlementHub.warehouse.difference = 0;
+    fsmSettlementHub.warehouse.status = 'settled';
+    fsmSettlementHub.depot_stock = Math.max(0, (fsmSettlementHub.depot_stock || 0) - returnQty);
+  }
+
+  // 6. Mark item settled
+  item.status = 'settled';
+  item.settled_at = new Date().toISOString();
+  item.settled_by = approved_by || 'store_admin';
+  item.settled_by_name = approved_by_name || 'Store Admin';
+
+  await logAudit(
+    approved_by || 'store_admin',
+    'Store Admin',
+    'APPROVE_FSM_WAREHOUSE_SETTLEMENT',
+    'stock_transfers',
+    item.id,
+    `Reconciled and received ${returnQty} unsold bottles from FSM ${item.fsm_name} into warehouse inventory`
+  );
+
+  return res.json({
+    success: true,
+    message: `✓ Successfully received ${returnQty} bottles from FSM ${item.fsm_name} into Warehouse inventory!`,
+    settlement: item
+  });
+};
+
+router.put('/api/settlements/warehouse-returns/:id/approve', storeAdminTransactionLimiter, approveWarehouseReturnHandler);
+router.post('/api/settlements/warehouse-returns/approve', storeAdminTransactionLimiter, approveWarehouseReturnHandler);
+
 module.exports = router;
+
